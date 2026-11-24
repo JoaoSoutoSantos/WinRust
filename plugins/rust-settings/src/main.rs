@@ -351,7 +351,7 @@ unsafe fn open_pick(hwnd: HWND, op: Op, row: usize) {
     let Some((items, cur)) = choices(op) else { return };
     let top = cur.unwrap_or(0).saturating_sub(PICK_MAX / 2).min(items.len().saturating_sub(PICK_MAX));
     APP.with_borrow_mut(|a| a.pick = Some(Pick { op, row, items, cur, hover: cur, top, t0: std::time::Instant::now() }));
-    unsafe { SetTimer(hwnd, 4, 15, None) }; // animation frames
+    winrust_common::frames::start(hwnd, 4); // animation frames
 }
 
 /// Where the open list sits (device px), how many items show, and whether it opens downward from its row.
@@ -1723,7 +1723,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_TIMER if wp == 4 => {
                 if APP.with_borrow(|a| a.pick.as_ref().is_none_or(|pk| pk.t0.elapsed().as_millis() > 220)) {
-                    KillTimer(hwnd, 4);
+                    winrust_common::frames::stop(hwnd, 4);
                 }
                 InvalidateRect(hwnd, null(), 0);
                 0

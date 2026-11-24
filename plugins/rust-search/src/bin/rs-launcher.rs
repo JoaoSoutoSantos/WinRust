@@ -59,9 +59,6 @@ fn c_bg() -> Rgb {
 fn c_border() -> Rgb {
     cr(pal().line)
 }
-fn c_sel() -> Rgb {
-    cr(pal().active)
-}
 fn c_accent() -> Rgb {
     cr(pal().accent)
 }
@@ -147,13 +144,24 @@ fn argb(c: Rgb) -> u32 {
     0xff00_0000 | (c.0 as u32) << 16 | (c.1 as u32) << 8 | c.2 as u32
 }
 
-/// Asks every drive's service, in drive order; a drive whose service is down or busy is skipped.
+/// Asks every drive's service in parallel; a drive whose service is down or busy is skipped.
 fn ask(q: &str) -> Vec<String> {
-    common::drive_letters()
-        .into_iter()
-        .filter_map(|d| common::ask(d, q)?.ok())
-        .flat_map(|s| s.lines().filter(|l| !l.is_empty() && !l.starts_with("... ")).map(String::from).collect::<Vec<_>>())
-        .collect()
+    let drives = common::drive_letters();
+    if drives.len() <= 1 {
+        return drives
+            .into_iter()
+            .filter_map(|d| common::ask(d, q)?.ok())
+            .flat_map(|s| s.lines().filter(|l| !l.is_empty() && !l.starts_with("... ")).map(String::from).collect::<Vec<_>>())
+            .collect();
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = drives.into_iter().map(|d| s.spawn(move || common::ask(d, q).and_then(Result::ok))).collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .flat_map(|s| s.lines().filter(|l| !l.is_empty() && !l.starts_with("... ")).map(String::from).collect::<Vec<_>>())
+            .collect()
+    })
 }
 
 fn is_app(path: &str) -> bool {
@@ -202,7 +210,7 @@ fn target_height(s: &St) -> f32 {
 }
 
 unsafe fn start_anim(h: HWND) {
-    SetTimer(h, T_ANIM, 15, None);
+    winrust_common::frames::start(h, T_ANIM);
 }
 
 unsafe fn show(h: HWND, run: bool) {
@@ -260,7 +268,7 @@ unsafe fn step(h: HWND) {
         let now = Instant::now();
         let dt = s.last.map_or(0.016, |l| (now - l).as_secs_f32()).min(0.05);
         s.last = Some(now);
-        let (k, ks) = (1.0 - (-dt * 20.0).exp(), 1.0 - (-dt * 32.0).exp());
+        let (k, ks) = (1.0 - (-dt * 26.0).exp(), 1.0 - (-dt * 38.0).exp());
         let mut moving = false;
         let want_row = (s.sel - s.top) as f32;
         ease(&mut s.alpha, s.ta, k, 0.004, &mut moving);
@@ -279,10 +287,10 @@ unsafe fn step(h: HWND) {
     InvalidateRect(h, null(), 0);
     if gone {
         ShowWindow(h, SW_HIDE);
-        KillTimer(h, T_ANIM);
+        winrust_common::frames::stop(h, T_ANIM);
         KillTimer(h, T_CARET);
     } else if !moving {
-        KillTimer(h, T_ANIM);
+        winrust_common::frames::stop(h, T_ANIM);
     }
 }
 
@@ -328,6 +336,8 @@ unsafe fn open(h: HWND, reveal: bool) {
     if reveal {
         winrust_common::reveal(&p);
     } else {
+        // the Store Calculator / Notepad freeze the screen without Explorer as the shell: WinRust's own ones when installed
+        let p = winrust_common::apps::own_app(&p).map_or(p, |e| e.to_string_lossy().into_owned());
         ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(&p).as_ptr(), null(), null(), SW_SHOWNORMAL);
     }
 }
@@ -338,6 +348,7 @@ unsafe fn run_selected(h: HWND, admin: bool) {
     use windows_sys::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW};
     let Some(line) = st(|s| s.results.get(s.sel).cloned()) else { return };
     let (file, args) = run::split_cmd(&run::expand(&line), |p| std::path::Path::new(p).exists());
+    let file = winrust_common::apps::own_app(&file).map_or(file, |e| e.to_string_lossy().into_owned()); // ms-calculator: and the like
     hide(h);
     let (verb, file_w, args_w, dir_w) = (wide(if admin { "runas" } else { "open" }), wide(&file), wide(&args), wide(&std::env::var("USERPROFILE").unwrap_or_default()));
     let mut ei: SHELLEXECUTEINFOW = zeroed();
@@ -427,7 +438,7 @@ unsafe fn text_changed(h: HWND) {
         });
         start_anim(h);
     } else {
-        SetTimer(h, T_DEBOUNCE, 70, None); // wait for a pause in typing before asking
+        SetTimer(h, T_DEBOUNCE, 25, None); // crisp Spotlight-like responsiveness
     }
     InvalidateRect(h, null(), 0);
 }
@@ -646,6 +657,18 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                     apply_results(h, res);
                 }
             }
+            0
+        }
+        WM_ICON_READY => {
+            let (p, ic) = *Box::from_raw(wp as *mut (String, isize));
+            st(|s| {
+                if let Some(old) = s.icons.insert(p, ic) {
+                    if old != 0 && old != ic {
+                        DestroyIcon(old as _);
+                    }
+                }
+            });
+            InvalidateRect(h, null(), 0);
             0
         }
         WM_ERASEBKGND => 1,
@@ -1221,33 +1244,56 @@ unsafe fn icon_path(p: &str) -> String {
     if n > 0 && n < b.len() { String::from_utf16_lossy(&b[..n]) } else { e }
 }
 
-unsafe fn ensure_icons() {
-    st(|s| {
-        if s.icons.len() > 300 {
+const WM_ICON_READY: u32 = WM_APP + 9; // worker -> UI: wp = Box<(String, isize)>
+static ICON_TX: std::sync::OnceLock<std::sync::mpsc::Sender<(String, isize)>> = std::sync::OnceLock::new();
+
+fn queue_icon(p: String, h: HWND) {
+    let tx = ICON_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, isize)>();
+        std::thread::spawn(move || unsafe {
+            while let Ok((path_str, hw)) = rx.recv() {
+                let mut fi: SHFILEINFOW = zeroed();
+                let path = wide(&icon_path(&path_str));
+                SHGetFileInfoW(path.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
+                if fi.hIcon.is_null() {
+                    SHGetFileInfoW(path.as_ptr(), 0x80, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
+                }
+                let payload = Box::into_raw(Box::new((path_str, fi.hIcon as isize)));
+                if PostMessageW(hw as HWND, WM_ICON_READY, payload as WPARAM, 0) == 0 {
+                    drop(Box::from_raw(payload));
+                }
+            }
+        });
+        tx
+    });
+    let _ = tx.send((p, h as isize));
+}
+
+unsafe fn ensure_icons(h: HWND) {
+    let need: Vec<String> = st(|s| {
+        if s.icons.len() > 400 {
             for (_, i) in s.icons.drain() {
                 if i != 0 {
                     DestroyIcon(i as _);
                 }
             }
         }
-    });
-    let need: Vec<String> = st(|s| s.results.iter().skip(s.top).take(MAX_ROWS).filter(|p| !s.icons.contains_key(*p)).cloned().collect());
-    for p in need {
-        let mut fi: SHFILEINFOW = zeroed();
-        let path = wide(&icon_path(&p));
-        SHGetFileInfoW(path.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
-        if fi.hIcon.is_null() {
-            // no icon of its own (unregistered type, vanished file): the generic one for that extension
-            SHGetFileInfoW(path.as_ptr(), 0x80, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
+        let mut out = Vec::new();
+        for p in s.results.iter().skip(s.top).take(MAX_ROWS) {
+            if !s.icons.contains_key(p) {
+                s.icons.insert(p.clone(), 0); // mark pending so it is queued once
+                out.push(p.clone());
+            }
         }
-        st(|s| {
-            s.icons.insert(p, fi.hIcon as isize);
-        });
+        out
+    });
+    for p in need {
+        queue_icon(p, h);
     }
 }
 
 unsafe fn paint(h: HWND) {
-    ensure_icons();
+    ensure_icons(h);
     let v = st(|s| View {
         scale: s.scale,
         fonts: s.fonts,
@@ -1272,15 +1318,24 @@ unsafe fn paint(h: HWND) {
     let dc = BeginPaint(h, &mut ps);
     let mut rc: RECT = zeroed();
     GetClientRect(h, &mut rc);
-    let (w, hgt) = (rc.right, rc.bottom);
-    let mem = CreateCompatibleDC(dc);
-    let bmp = CreateCompatibleBitmap(dc, w, hgt);
-    let old = SelectObject(mem, bmp);
+    let (w, hgt) = (rc.right.max(1), rc.bottom.max(1));
+    thread_local! {
+        static BUF: std::cell::Cell<(HDC, HBITMAP, i32, i32)> = const { std::cell::Cell::new((null_mut(), null_mut(), 0, 0)) };
+    }
+    let mem = BUF.with(|b| {
+        let (mut mdc, mut bmp, bw, bh) = b.get();
+        if mdc.is_null() || bw != w || bh != hgt {
+            if !bmp.is_null() { DeleteObject(bmp); }
+            if !mdc.is_null() { DeleteDC(mdc); }
+            mdc = CreateCompatibleDC(dc);
+            bmp = CreateCompatibleBitmap(dc, w, hgt);
+            SelectObject(mdc, bmp);
+            b.set((mdc, bmp, w, hgt));
+        }
+        mdc
+    });
     draw(mem, w, hgt, &v);
     BitBlt(dc, 0, 0, w, hgt, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
     EndPaint(h, &ps);
 }
 
@@ -1319,7 +1374,11 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
     let s = v.scale;
     let p = |x: i32| (x as f32 * s).round() as i32;
     SetBkMode(dc, TRANSPARENT as i32);
-    fill(dc, 0, 0, w, hgt, c_bg());
+    let surface = cr(mixc(pal().bg, pal().text, 0.03));
+    let pill_bg = cr(mixc(pal().bg, pal().text, 0.065));
+    let pill_ring = cr(mixc(pal().accent, pal().line, 0.45));
+    let badge_bg = cr(mixc(pal().bg, pal().text, 0.09));
+    fill(dc, 0, 0, w, hgt, surface);
 
     let (rows_top, row_h) = (p(INPUT_H + PAD), ROW_H as f32 * s);
     let nrows = v.rows.len();
@@ -1328,22 +1387,45 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
     let mut g: *mut GpGraphics = null_mut();
     GdipCreateFromHDC(dc, &mut g);
     GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    // Sleek rounded input pill inside the top header
+    let (px, py, pw, ph) = (p(12) as f32, p(10) as f32, (w - p(24)) as f32, p(INPUT_H - 20) as f32);
+    round_rect(g, px, py, pw, ph, 11.0 * s, pill_ring);
+    round_rect(g, px + 1.2 * s, py + 1.2 * s, pw - 2.4 * s, ph - 2.4 * s, 10.0 * s, pill_bg);
+    // Right-side badge pill ("Alt+Space" when empty, or result count when searching)
+    let badge_txt = if v.total > 0 {
+        format!("{}", v.total)
+    } else if v.run {
+        "Win+R".into()
+    } else {
+        "Esc".into()
+    };
+    let bw = (if v.total > 0 { 44.0 } else { 52.0 }) * s;
+    let bh = 22.0 * s;
+    let (bx, by) = (px + pw - bw - 10.0 * s, py + (ph - bh) / 2.0);
+    round_rect(g, bx, by, bw, bh, 6.0 * s, if v.total > 0 { cr(mixc(pal().bg, pal().accent, 0.22)) } else { badge_bg });
+
     if nrows > 0 && v.purge.is_none() {
         let y = rows_top as f32 + v.sel_f * row_h;
-        round_rect(g, p(PAD) as f32, y + 2.0 * s, (w - 2 * p(PAD)) as f32, row_h - 4.0 * s, 10.0 * s, c_sel());
-        round_rect(g, p(PAD + 4) as f32, y + row_h / 2.0 - 10.0 * s, 3.0 * s, 20.0 * s, 1.5 * s, c_accent());
+        let sel_bg = cr(mixc(pal().active, pal().accent, 0.14));
+        round_rect(g, p(PAD + 4) as f32, y + 2.0 * s, (w - 2 * p(PAD + 4)) as f32, row_h - 4.0 * s, 10.0 * s, sel_bg);
+        round_rect(g, p(PAD + 8) as f32, y + row_h / 2.0 - 11.0 * s, 3.0 * s, 22.0 * s, 1.5 * s, c_accent());
     }
     GdipDeleteGraphics(g);
 
     // input row
     let mid = p(INPUT_H) / 2;
-    let (glyph, gc) = if v.run { ("\u{E756}", c_accent()) } else { ("\u{E721}", c_dim()) }; // Run mode: a prompt, not a magnifier
-    text(dc, v.fonts[F_ICON], gc, RECT { left: p(22), top: mid - p(14), right: p(52), bottom: mid + p(14) }, glyph, DT_SINGLELINE | DT_VCENTER);
-    let area = RECT { left: p(58), top: mid - p(18), right: w - p(24), bottom: mid + p(18) };
+    let (glyph, gc) = if v.run { ("\u{E756}", c_accent()) } else { ("\u{E721}", c_accent()) };
+    text(dc, v.fonts[F_ICON], gc, RECT { left: p(24), top: mid - p(14), right: p(52), bottom: mid + p(14) }, glyph, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    let area = RECT { left: p(56), top: mid - p(18), right: bx as i32 - p(10), bottom: mid + p(18) };
+    text(dc, v.fonts[F_HINT], if v.total > 0 { c_accent() } else { c_dim() }, RECT { left: bx as i32, top: by as i32, right: (bx + bw) as i32, bottom: (by + bh) as i32 }, &badge_txt, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
     let shown = String::from_utf16_lossy(&v.text);
     if v.text.is_empty() {
-        let hint = if v.run { winrust_common::t!("Программа, папка, документ или сайт", "Type a program, folder, document or website", ja: "プログラム、フォルダー、ドキュメント、Web サイトを入力", pt: "Digite um programa, pasta, documento ou site") } else { "Search files and apps" };
-        text(dc, v.fonts[F_INPUT], c_faint(), area, hint, DT_SINGLELINE | DT_VCENTER);
+        let hint = if v.run {
+            winrust_common::t!("Программа, папка, документ или сайт", "Type a program, folder, document or website", ja: "プログラム、フォルダー、ドキュメント、Web サイトを入力", pt: "Digite um programa, pasta, documento ou site")
+        } else {
+            winrust_common::t!("Поиск файлов и программ…", "Search files and apps…", ja: "ファイルとアプリを検索…", pt: "Pesquisar arquivos e aplicativos…")
+        };
+        text(dc, v.fonts[F_INPUT], c_dim(), area, hint, DT_SINGLELINE | DT_VCENTER);
     } else {
         let mut size: SIZE = zeroed();
         let old = SelectObject(dc, v.fonts[F_INPUT] as _);
@@ -1354,16 +1436,16 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
         IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
         text(dc, v.fonts[F_INPUT], c_text(), RECT { left: area.left - overflow, ..area }, &shown, DT_SINGLELINE | DT_VCENTER | DT_NOCLIP);
         if v.caret {
-            fill(dc, area.left - overflow + size.cx + p(2), mid - p(13), area.left - overflow + size.cx + p(4), mid + p(13), c_accent());
+            fill(dc, area.left - overflow + size.cx + p(2), mid - p(11), area.left - overflow + size.cx + p(2) + p(2).max(1), mid + p(11), c_accent());
         }
         RestoreDC(dc, saved);
     }
     if v.text.is_empty() && v.caret {
-        fill(dc, p(58), mid - p(13), p(58) + p(2), mid + p(13), c_accent());
+        fill(dc, p(56), mid - p(11), p(56) + p(2).max(1), mid + p(11), c_accent());
     }
 
     if !v.text.is_empty() || v.purge.is_some() || nrows > 0 {
-        fill(dc, p(PAD + 6), p(INPUT_H) - 1, w - p(PAD + 6), p(INPUT_H), c_border()); // separator
+        fill(dc, p(14), p(INPUT_H) - 1, w - p(14), p(INPUT_H), c_border()); // separator
     }
     if let Some(pv) = &v.purge {
         return draw_purge(dc, w, v, pv);
@@ -1422,14 +1504,9 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
 }
 
 fn main() {
-    use std::os::windows::process::CommandExt;
     if std::env::args().nth(1).as_deref() == Some("--autostart") {
         let exe = std::env::current_exe().unwrap();
-        let ok = std::process::Command::new("reg")
-            .args(winrust_common::reg::user_args(&["add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "rs-launcher", "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"]))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok = winrust_common::regexe::exec(&winrust_common::reg::user_args(&["add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "rs-launcher", "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"])).is_ok();
         std::process::exit(if ok { 0 } else { 1 });
     }
     unsafe {
@@ -1472,16 +1549,22 @@ fn main() {
         }
         // SearchHost is started by svchost as a packaged app, which ignores the IFEO block the installer sets: end it whenever it appears.
         // Only when the installer's block is present (an uninstalled / unblocked setup must get its search back).
-        let blocked = std::process::Command::new("reg").args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SearchHost.exe", "/v", "Debugger"]).creation_flags(0x0800_0000).output().is_ok_and(|o| o.status.success());
+        let blocked = winrust_common::regexe::exec(&["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SearchHost.exe", "/v", "Debugger"]).is_ok();
         if blocked {
             std::thread::spawn(|| {
-                let Ok(mut sys) = sysinfo::System::new() else { return };
+                use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
                 loop {
-                    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                    sys.processes_by_exact_name("SearchHost.exe".as_ref()).for_each(|p| {
-                        p.kill();
-                    });
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // Lightweight Toolhelp snapshot instead of sysinfo::System::refresh_processes(All, true) every 2s.
+                    for (pid, name) in winrust_common::proc::list() {
+                        if name.eq_ignore_ascii_case("SearchHost.exe") {
+                            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                            if !h.is_null() {
+                                TerminateProcess(h, 0);
+                                CloseHandle(h);
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
                 }
             });
         }

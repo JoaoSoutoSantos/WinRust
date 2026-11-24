@@ -1,5 +1,5 @@
 //! The UI style shared by the WinRust programs: %ProgramData%\WinRust\style.txt holds its name (the topbar gear menu writes it).
-//! Programs re-read it at most once a second and repaint at once on the broadcast `set_style` sends (`msg()`).
+//! Programs re-read it when the folder changes (see `generation`) and repaint at once on the broadcast `set_style` sends (`msg()`).
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -58,13 +58,68 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+// ---------- when to read the setting files again ----------
+// Every setting caches its file's value with the generation it was read at. The generation moves on when Windows
+// reports a write in %ProgramData%\WinRust (a change notification, checked without blocking), on `reload()` (the
+// broadcast), or once a second while the folder cannot be watched yet. So nothing touches the disk while nothing changed.
+
+static GEN: AtomicU64 = AtomicU64::new(1);
+static WATCH: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0); // 0 = not set up, -1 = failed
+static WATCH_TRY: AtomicU64 = AtomicU64::new(0); // when setting it up last failed (ms)
+
+fn generation() -> u64 {
+    use windows_sys::Win32::{
+        Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
+        Storage::FileSystem::{FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindFirstChangeNotificationW, FindNextChangeNotification},
+        System::Threading::WaitForSingleObject,
+    };
+    let mut h = WATCH.load(Relaxed);
+    if h == 0 || (h == -1 && stale(&WATCH_TRY)) {
+        let dir = std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust"));
+        let w: Option<Vec<u16>> = dir.map(|d| d.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect());
+        let nh = w.map_or(INVALID_HANDLE_VALUE, |w| unsafe { FindFirstChangeNotificationW(w.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME) });
+        let nh = if nh == INVALID_HANDLE_VALUE || nh.is_null() { -1 } else { nh as isize };
+        match WATCH.compare_exchange(h, nh, Relaxed, Relaxed) {
+            Ok(_) => {
+                h = nh;
+                GEN.fetch_add(1, Relaxed); // fresh watch (or still none): read everything once more
+                if nh == -1 {
+                    WATCH_TRY.store(now_ms(), Relaxed);
+                }
+            }
+            Err(cur) => {
+                if nh != -1 {
+                    unsafe { windows_sys::Win32::Foundation::CloseHandle(nh as _) }; // another thread won the race
+                }
+                h = cur;
+            }
+        }
+    }
+    if h > 0 && unsafe { WaitForSingleObject(h as _, 0) } == WAIT_OBJECT_0 {
+        unsafe { FindNextChangeNotification(h as _) };
+        GEN.fetch_add(1, Relaxed);
+    }
+    GEN.load(Relaxed)
+}
+
+/// True when the value cached at generation `at` may be out of date.
+fn stale(at: &AtomicU64) -> bool {
+    at.load(Relaxed) != generation()
+}
+
+/// Marks a value as read (or just written) now.
+fn fresh(at: &AtomicU64) {
+    at.store(generation(), Relaxed);
+}
+
 fn store(s: Style) {
     CUR.store(ALL.iter().position(|&v| v == s).unwrap_or(0) as u8, Relaxed);
-    READ_AT.store(now_ms(), Relaxed);
+    fresh(&READ_AT);
 }
 
 /// Reads the file again now (on the "style changed" broadcast).
 pub fn reload() {
+    GEN.fetch_add(1, Relaxed); // the broadcast: every cached setting is read again on its next use
     // WINRUST_STYLE overrides the file for this process only (to look at a style without switching every window)
     let name = std::env::var("WINRUST_STYLE").ok().or_else(|| file().and_then(|f| std::fs::read_to_string(f).ok()));
     store(Style::parse(&name.unwrap_or_default()));
@@ -72,7 +127,7 @@ pub fn reload() {
 
 /// The current style. The file is read again at most once a second, so a program that missed the broadcast still follows.
 pub fn style() -> Style {
-    if CUR.load(Relaxed) == u8::MAX || now_ms().saturating_sub(READ_AT.load(Relaxed)) > 1000 {
+    if CUR.load(Relaxed) == u8::MAX || stale(&READ_AT) {
         reload();
     }
     ALL[CUR.load(Relaxed) as usize % ALL.len()]
@@ -94,9 +149,9 @@ fn autohide_file() -> Option<PathBuf> {
 
 /// The bar hides when the pointer is away and comes back at the screen edge (off unless the file says 1). Re-read once a second.
 pub fn autohide() -> bool {
-    if now_ms().saturating_sub(HIDE_AT.load(Relaxed)) > 1000 {
+    if stale(&HIDE_AT) {
         HIDE.store(autohide_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1") as u8, Relaxed);
-        HIDE_AT.store(now_ms(), Relaxed);
+        fresh(&HIDE_AT);
     }
     HIDE.load(Relaxed) == 1
 }
@@ -106,7 +161,7 @@ static HIDE_AT: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_autohide(on: bool) {
     HIDE.store(on as u8, Relaxed);
-    HIDE_AT.store(now_ms(), Relaxed);
+    fresh(&HIDE_AT);
     if let Some(f) = autohide_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, if on { "1" } else { "0" });
@@ -122,16 +177,16 @@ static LEFT_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Start and the pinned apps sit at the bar's left end, like Windows 10 (off unless the file says 1). Re-read once a second.
 pub fn align_left() -> bool {
-    if now_ms().saturating_sub(LEFT_AT.load(Relaxed)) > 1000 {
+    if stale(&LEFT_AT) {
         LEFT.store(left_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1") as u8, Relaxed);
-        LEFT_AT.store(now_ms(), Relaxed);
+        fresh(&LEFT_AT);
     }
     LEFT.load(Relaxed) == 1
 }
 
 pub fn set_align_left(on: bool) {
     LEFT.store(on as u8, Relaxed);
-    LEFT_AT.store(now_ms(), Relaxed);
+    fresh(&LEFT_AT);
     if let Some(f) = left_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, if on { "1" } else { "0" });
@@ -180,10 +235,10 @@ fn side_code(s: Side) -> u8 {
 
 /// The bar's edge (bottom unless %ProgramData%\WinRust\side.txt says left or right). Re-read once a second.
 pub fn side() -> Side {
-    if now_ms().saturating_sub(SIDE_AT.load(Relaxed)) > 1000 {
+    if stale(&SIDE_AT) {
         let s = side_file().and_then(|f| std::fs::read_to_string(f).ok()).map_or(Side::Bottom, |s| Side::parse(&s));
         SIDE.store(side_code(s), Relaxed);
-        SIDE_AT.store(now_ms(), Relaxed);
+        fresh(&SIDE_AT);
     }
     match SIDE.load(Relaxed) {
         1 => Side::Left,
@@ -194,7 +249,7 @@ pub fn side() -> Side {
 
 pub fn set_side(s: Side) {
     SIDE.store(side_code(s), Relaxed);
-    SIDE_AT.store(now_ms(), Relaxed);
+    fresh(&SIDE_AT);
     if let Some(f) = side_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, s.name());
@@ -319,9 +374,9 @@ fn colors_text(c: &[u32; 7], sep: &str) -> String {
 /// The user's colours (one per `COLOR_NAMES`, u32::MAX = not set), None when none is set. Re-read once a second.
 pub fn custom_colors() -> Option<[u32; 7]> {
     let mut c = COLORS.lock().unwrap();
-    if now_ms().saturating_sub(COLORS_AT.load(Relaxed)) > 1000 {
+    if stale(&COLORS_AT) {
         *c = read_colors();
-        COLORS_AT.store(now_ms(), Relaxed);
+        fresh(&COLORS_AT);
     }
     c.iter().any(|v| *v != u32::MAX).then_some(*c)
 }
@@ -346,7 +401,7 @@ fn save_colors(c: [u32; 7]) {
         let _ = if text.is_empty() { std::fs::remove_file(f) } else { std::fs::write(f, text) };
     }
     *COLORS.lock().unwrap() = c;
-    COLORS_AT.store(now_ms(), Relaxed);
+    fresh(&COLORS_AT);
     unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
 }
 
@@ -359,10 +414,10 @@ static OPACITY_AT: AtomicU64 = AtomicU64::new(0);
 
 /// How opaque the topbar is, percent (30..=100). Re-read once a second.
 pub fn bar_opacity() -> u8 {
-    if now_ms().saturating_sub(OPACITY_AT.load(Relaxed)) > 1000 {
+    if stale(&OPACITY_AT) {
         let v = opacity_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).map_or(100, |v| v.clamp(30, 100));
         OPACITY.store(v, Relaxed);
-        OPACITY_AT.store(now_ms(), Relaxed);
+        fresh(&OPACITY_AT);
     }
     OPACITY.load(Relaxed)
 }
@@ -370,7 +425,7 @@ pub fn bar_opacity() -> u8 {
 pub fn set_bar_opacity(v: u8) {
     let v = v.clamp(30, 100);
     OPACITY.store(v, Relaxed);
-    OPACITY_AT.store(now_ms(), Relaxed);
+    fresh(&OPACITY_AT);
     if let Some(f) = opacity_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, v.to_string());
@@ -433,6 +488,12 @@ pub fn reset_all() {
     set_autohide(false);
     set_align_left(false);
     set_alttab_per_monitor(false);
+    set_show_search_btn(true);
+    set_use_rust_explorer(true);
+    set_explorer_start(0);
+    set_explorer_hidden(false);
+    FLAGS.iter().for_each(|&f| set_flag(f, f.default()));
+    NUMS.iter().for_each(|&n| set_num(n, n.default()));
     Theme { name: String::new(), style: Style::Normal, colors: [u32::MAX; 7], opacity: 100 }.apply();
 }
 
@@ -611,17 +672,17 @@ static SIZE_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Height class of the topbar: 0 small, 1 normal (default), 2 large. Re-read once a second.
 pub fn bar_size() -> u8 {
-    if now_ms().saturating_sub(SIZE_AT.load(Relaxed)) > 1000 {
+    if stale(&SIZE_AT) {
         let v = size_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).filter(|v| *v <= 2).unwrap_or(1);
         SIZE.store(v, Relaxed);
-        SIZE_AT.store(now_ms(), Relaxed);
+        fresh(&SIZE_AT);
     }
     SIZE.load(Relaxed)
 }
 
 pub fn set_bar_size(v: u8) {
     SIZE.store(v.min(2), Relaxed);
-    SIZE_AT.store(now_ms(), Relaxed);
+    fresh(&SIZE_AT);
     if let Some(f) = size_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, v.min(2).to_string());
@@ -637,18 +698,331 @@ static MON_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Alt+Tab lists only the windows of the monitor the active window is on (off unless the file says 1). Re-read once a second.
 pub fn alttab_per_monitor() -> bool {
-    if now_ms().saturating_sub(MON_AT.load(Relaxed)) > 1000 {
+    if stale(&MON_AT) {
         MON.store(mon_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1") as u8, Relaxed);
-        MON_AT.store(now_ms(), Relaxed);
+        fresh(&MON_AT);
     }
     MON.load(Relaxed) == 1
 }
 
 pub fn set_alttab_per_monitor(on: bool) {
     MON.store(on as u8, Relaxed);
-    MON_AT.store(now_ms(), Relaxed);
+    fresh(&MON_AT);
     if let Some(f) = mon_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, if on { "1" } else { "0" });
+    }
+}
+
+fn cfg_file(name: &str) -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join(name))
+}
+
+fn cfg_write(name: &str, val: &str) {
+    if let Some(f) = cfg_file(name) {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, val);
+    }
+}
+
+static SEARCH_BTN: AtomicU8 = AtomicU8::new(1);
+static SEARCH_BTN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Show the search magnifying-glass button on the taskbar (on by default).
+pub fn show_search_btn() -> bool {
+    if stale(&SEARCH_BTN_AT) {
+        let on = cfg_file("show-search.txt").and_then(|f| std::fs::read_to_string(f).ok()).map_or(true, |s| s.trim() != "0");
+        SEARCH_BTN.store(on as u8, Relaxed);
+        fresh(&SEARCH_BTN_AT);
+    }
+    SEARCH_BTN.load(Relaxed) == 1
+}
+
+pub fn set_show_search_btn(on: bool) {
+    SEARCH_BTN.store(on as u8, Relaxed);
+    fresh(&SEARCH_BTN_AT);
+    cfg_write("show-search.txt", if on { "1" } else { "0" });
+}
+
+static USE_RX: AtomicU8 = AtomicU8::new(1);
+static USE_RX_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Clicking the File Explorer taskbar pin opens Rust Explorer when installed (on by default).
+pub fn use_rust_explorer() -> bool {
+    if stale(&USE_RX_AT) {
+        let on = cfg_file("use-rust-explorer.txt").and_then(|f| std::fs::read_to_string(f).ok()).map_or(true, |s| s.trim() != "0");
+        USE_RX.store(on as u8, Relaxed);
+        fresh(&USE_RX_AT);
+    }
+    USE_RX.load(Relaxed) == 1
+}
+
+pub fn set_use_rust_explorer(on: bool) {
+    USE_RX.store(on as u8, Relaxed);
+    fresh(&USE_RX_AT);
+    cfg_write("use-rust-explorer.txt", if on { "1" } else { "0" });
+}
+
+static EXP_START: AtomicU8 = AtomicU8::new(0);
+static EXP_START_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Default folder when rust-explorer opens with no path: 0 = Home, 1 = Desktop, 2 = Downloads, 3 = C:\.
+pub fn explorer_start() -> u8 {
+    if stale(&EXP_START_AT) {
+        let v = cfg_file("explorer-start.txt").and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).filter(|v| *v <= 3).unwrap_or(0);
+        EXP_START.store(v, Relaxed);
+        fresh(&EXP_START_AT);
+    }
+    EXP_START.load(Relaxed)
+}
+
+pub fn set_explorer_start(v: u8) {
+    let v = v.min(3);
+    EXP_START.store(v, Relaxed);
+    fresh(&EXP_START_AT);
+    cfg_write("explorer-start.txt", &v.to_string());
+}
+
+static EXP_HID: AtomicU8 = AtomicU8::new(0);
+static EXP_HID_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Show hidden files in rust-explorer (off by default).
+pub fn explorer_hidden() -> bool {
+    if stale(&EXP_HID_AT) {
+        let on = cfg_file("explorer-hidden.txt").and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1");
+        EXP_HID.store(on as u8, Relaxed);
+        fresh(&EXP_HID_AT);
+    }
+    EXP_HID.load(Relaxed) == 1
+}
+
+pub fn set_explorer_hidden(on: bool) {
+    EXP_HID.store(on as u8, Relaxed);
+    fresh(&EXP_HID_AT);
+    cfg_write("explorer-hidden.txt", if on { "1" } else { "0" });
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
+// ---------- on/off switches for the taskbar and rust-explorer (StartAllBack-style tweaks) ----------
+
+/// A taskbar behaviour the user can switch on or off. Each lives in `%ProgramData%\WinRust\<file>` as `1` / `0`;
+/// a missing file means the default. Read again only when the folder changes (see `generation`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flag {
+    ClockSeconds,  // the clock shows seconds
+    ClockDate,     // the date under the time
+    EmptyDesktop,  // a click on an empty spot of the bar shows the desktop
+    WheelWindows,  // the wheel over an app button cycles its windows (elsewhere it stays volume)
+    Animations,    // slides, fades and hover glows
+    // rust-explorer
+    ExpExtensions, // file name extensions shown
+    ExpFoldersFirst, // folders sorted above files
+    ExpSingleClick, // one click opens (hover selects)
+    ExpThumbs,     // new windows open in the thumbnail view
+    // topbar: which system icons the bar draws
+    ShowLang,      // the keyboard language
+    ShowNet,       // the network icon
+    ShowVol,       // the volume icon
+    ShowBat,       // the battery (only on a laptop)
+    // topbar widgets
+    WidgetsBtn,    // the widgets button next to the gear
+    MiniCpu,       // CPU load drawn on the bar itself
+    MiniRam,       // memory use drawn on the bar itself
+    WCpu,          // the widgets panel's cards and sections
+    WRam,
+    WDisk,
+    WNet,
+    WCal,
+    WMedia,
+}
+
+pub const FLAGS: [Flag; 22] = [
+    Flag::ClockSeconds, Flag::ClockDate, Flag::EmptyDesktop, Flag::WheelWindows, Flag::Animations,
+    Flag::ExpExtensions, Flag::ExpFoldersFirst, Flag::ExpSingleClick, Flag::ExpThumbs,
+    Flag::ShowLang, Flag::ShowNet, Flag::ShowVol, Flag::ShowBat,
+    Flag::WidgetsBtn, Flag::MiniCpu, Flag::MiniRam, Flag::WCpu, Flag::WRam, Flag::WDisk, Flag::WNet, Flag::WCal, Flag::WMedia,
+];
+/// The switches shown on the topbar's Tweaks page (the rest are on its Explorer page).
+pub const TASKBAR_FLAGS: usize = 5;
+
+impl Flag {
+    fn file(self) -> &'static str {
+        match self {
+            Flag::ClockSeconds => "clock-seconds.txt",
+            Flag::ClockDate => "clock-date.txt",
+            Flag::EmptyDesktop => "empty-click-desktop.txt",
+            Flag::WheelWindows => "wheel-windows.txt",
+            Flag::Animations => "animations.txt",
+            Flag::ExpExtensions => "explorer-extensions.txt",
+            Flag::ExpFoldersFirst => "explorer-folders-first.txt",
+            Flag::ExpSingleClick => "explorer-single-click.txt",
+            Flag::ExpThumbs => "explorer-thumbs.txt",
+            Flag::ShowLang => "tray-show-lang.txt",
+            Flag::ShowNet => "tray-show-net.txt",
+            Flag::ShowVol => "tray-show-volume.txt",
+            Flag::ShowBat => "tray-show-battery.txt",
+            Flag::WidgetsBtn => "widgets-button.txt",
+            Flag::MiniCpu => "widgets-bar-cpu.txt",
+            Flag::MiniRam => "widgets-bar-ram.txt",
+            Flag::WCpu => "widgets-cpu.txt",
+            Flag::WRam => "widgets-ram.txt",
+            Flag::WDisk => "widgets-disk.txt",
+            Flag::WNet => "widgets-net.txt",
+            Flag::WCal => "widgets-calendar.txt",
+            Flag::WMedia => "widgets-media.txt",
+        }
+    }
+    pub fn default(self) -> bool {
+        !matches!(self, Flag::ClockSeconds | Flag::EmptyDesktop | Flag::WheelWindows | Flag::ExpSingleClick | Flag::ExpThumbs | Flag::MiniCpu | Flag::MiniRam)
+    }
+    fn idx(self) -> usize {
+        FLAGS.iter().position(|&f| f == self).unwrap_or(0)
+    }
+}
+
+static FLAG_VAL: [AtomicU8; FLAGS.len()] = [const { AtomicU8::new(0) }; FLAGS.len()];
+static FLAG_AT: [AtomicU64; FLAGS.len()] = [const { AtomicU64::new(0) }; FLAGS.len()];
+
+/// Whether switch `f` is on.
+pub fn flag(f: Flag) -> bool {
+    let i = f.idx();
+    if stale(&FLAG_AT[i]) {
+        let on = cfg_file(f.file()).and_then(|p| std::fs::read_to_string(p).ok()).map_or(f.default(), |s| s.trim() == "1");
+        FLAG_VAL[i].store(on as u8, Relaxed);
+        fresh(&FLAG_AT[i]);
+    }
+    FLAG_VAL[i].load(Relaxed) == 1
+}
+
+/// Turns switch `f` on or off for every WinRust program (they repaint on the broadcast).
+pub fn set_flag(f: Flag, on: bool) {
+    let i = f.idx();
+    FLAG_VAL[i].store(on as u8, Relaxed);
+    fresh(&FLAG_AT[i]);
+    cfg_write(f.file(), if on { "1" } else { "0" });
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
+// ---------- bar personalization: small numbered choices (font, clock format, corners, spacing) ----------
+
+/// A choice with a few numbered values. Each lives in `%ProgramData%\WinRust\<file>` as a number; a missing or
+/// out-of-range file means the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Num {
+    Font,     // the bar's font: 0 = the style's own, else BAR_FONTS[n]
+    FontSize, // 0 small, 1 normal, 2 large, 3 larger
+    ClockFmt, // 0 as Windows says, 1 24-hour, 2 12-hour
+    DateFmt,  // 0 short (Windows), 1 day and month name, 2 ISO 2026-11-22, 3 weekday + day
+    Radius,   // corners of the bar's buttons: 0 the style's, 1 square, 2 small, 3 round
+    IconGap,  // space between app buttons: 0 tight, 1 normal, 2 wide
+}
+
+pub const NUMS: [Num; 6] = [Num::Font, Num::FontSize, Num::ClockFmt, Num::DateFmt, Num::Radius, Num::IconGap];
+
+/// Font faces offered for the bar (index 0 = the style's own font).
+pub const BAR_FONTS: [&str; 5] = ["", "Segoe UI", "Bahnschrift", "Consolas", "Georgia"];
+
+impl Num {
+    fn file(self) -> &'static str {
+        match self {
+            Num::Font => "bar-font.txt",
+            Num::FontSize => "bar-font-size.txt",
+            Num::ClockFmt => "clock-format.txt",
+            Num::DateFmt => "date-format.txt",
+            Num::Radius => "corner-radius.txt",
+            Num::IconGap => "icon-gap.txt",
+        }
+    }
+    pub fn default(self) -> u8 {
+        match self {
+            Num::FontSize | Num::IconGap => 1,
+            _ => 0,
+        }
+    }
+    /// The highest value.
+    pub fn max(self) -> u8 {
+        match self {
+            Num::Font => BAR_FONTS.len() as u8 - 1,
+            Num::FontSize | Num::DateFmt | Num::Radius => 3,
+            Num::ClockFmt | Num::IconGap => 2,
+        }
+    }
+    fn idx(self) -> usize {
+        NUMS.iter().position(|&n| n == self).unwrap_or(0)
+    }
+}
+
+static NUM_VAL: [AtomicU8; NUMS.len()] = [const { AtomicU8::new(0) }; NUMS.len()];
+static NUM_AT: [AtomicU64; NUMS.len()] = [const { AtomicU64::new(0) }; NUMS.len()];
+
+fn parse_num(n: Num, s: Option<&str>) -> u8 {
+    s.and_then(|s| s.trim().parse::<u8>().ok()).filter(|&v| v <= n.max()).unwrap_or(n.default())
+}
+
+/// The current value of choice `n`.
+pub fn num(n: Num) -> u8 {
+    let i = n.idx();
+    if stale(&NUM_AT[i]) {
+        let v = parse_num(n, cfg_file(n.file()).and_then(|p| std::fs::read_to_string(p).ok()).as_deref());
+        NUM_VAL[i].store(v, Relaxed);
+        fresh(&NUM_AT[i]);
+    }
+    NUM_VAL[i].load(Relaxed)
+}
+
+/// Sets choice `n` for every WinRust program (they repaint on the broadcast).
+pub fn set_num(n: Num, v: u8) {
+    let (i, v) = (n.idx(), v.min(n.max()));
+    NUM_VAL[i].store(v, Relaxed);
+    fresh(&NUM_AT[i]);
+    cfg_write(n.file(), &v.to_string());
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
+/// The bar's font face: the one picked in the settings, else the style's.
+pub fn bar_face() -> &'static str {
+    match num(Num::Font) as usize {
+        0 => ui_face(),
+        i => BAR_FONTS[i],
+    }
+}
+
+/// Pixels added to the bar's text size (before scaling).
+pub fn bar_font_delta() -> i32 {
+    [-1, 0, 1, 3][num(Num::FontSize) as usize % 4]
+}
+
+/// Corner radius of the bar's buttons (before scaling) for the style's own value `own`.
+pub fn bar_radius(own: i32) -> i32 {
+    match num(Num::Radius) {
+        1 => 0,
+        2 => 4,
+        3 => 12,
+        _ => own,
+    }
+}
+
+#[cfg(test)]
+mod num_tests {
+    use super::*;
+
+    #[test]
+    fn parse_falls_back_to_default() {
+        assert_eq!(parse_num(Num::FontSize, None), 1);
+        assert_eq!(parse_num(Num::FontSize, Some("3")), 3);
+        assert_eq!(parse_num(Num::FontSize, Some("9")), 1);
+        assert_eq!(parse_num(Num::ClockFmt, Some(" 2
+")), 2);
+        assert_eq!(parse_num(Num::Font, Some("x")), 0);
+    }
+
+    #[test]
+    fn every_choice_has_its_own_file() {
+        let mut f: Vec<_> = NUMS.iter().map(|n| n.file()).collect();
+        f.extend(FLAGS.iter().map(|x| x.file()));
+        let n = f.len();
+        f.sort();
+        f.dedup();
+        assert_eq!(f.len(), n);
     }
 }

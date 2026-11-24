@@ -9,13 +9,16 @@ use std::{
     sync::atomic::{AtomicU8, Ordering::Relaxed},
 };
 
+pub mod apps;
 pub mod desktop;
 pub mod fg;
+pub mod frames;
 pub mod journal;
 pub mod mem;
 pub mod mft;
 pub mod proc;
 pub mod reg;
+pub mod regexe;
 pub mod settings;
 pub mod style;
 

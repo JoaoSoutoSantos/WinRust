@@ -1,6 +1,7 @@
 //! Install logic, shared by the window and the command line so both do exactly the same thing:
 //! process/registry helpers, the embedded payload, and one file per plugin with its install/uninstall pair.
 use crate::*;
+mod apps;
 mod explorer;
 mod journal;
 mod search;
@@ -8,16 +9,19 @@ mod session;
 mod taskmgr;
 mod tools;
 mod topbar;
-pub(crate) use {explorer::*, journal::*, search::*, session::*, taskmgr::*, tools::*, topbar::*};
+pub(crate) use {apps::*, explorer::*, journal::*, search::*, session::*, taskmgr::*, tools::*, topbar::*};
 
 pub(crate) fn out(prog: &str, args: &[&str]) -> Result<String, String> {
-    // reg.exe: HKCU means the signed-in user's, not the elevated account's (see session.rs)
-    let owned: Vec<String> = if prog == "reg" { i18n::reg::user_args(args) } else { args.iter().map(|a| a.to_string()).collect() };
-    let o = Command::new(prog).args(&owned).creation_flags(0x0800_0000).output().map_err(|e| format!("{prog}: {e}"))?;
+    if prog == "reg" {
+        // HKCU means the signed-in user's, not the elevated account's (see session.rs)
+        let owned = i18n::reg::user_args(args);
+        return i18n::regexe::exec(&owned).map_err(|e| format!("reg {}: {e}", owned.join(" ")));
+    }
+    let o = Command::new(prog).args(args).creation_flags(0x0800_0000).output().map_err(|e| format!("{prog}: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     } else {
-        Err(format!("{prog} {}: {}{}", owned.join(" "), String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()))
+        Err(format!("{prog} {}: {}{}", args.join(" "), String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()))
     }
 }
 

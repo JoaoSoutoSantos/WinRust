@@ -190,6 +190,9 @@ pub fn is_admin() -> bool {
 /// с правами администратора и без окна UAC. false — задачи нет или она не запустилась.
 pub fn run_elevated_task() -> bool {
     use std::os::windows::process::CommandExt;
+    // the task's process starts in the background: let it take the foreground we got from the user's key press,
+    // or its window opens behind the active one and looks like it never came (or vanished)
+    unsafe { winapi::um::winuser::AllowSetForegroundWindow(winapi::um::winuser::ASFW_ANY) };
     std::process::Command::new("schtasks").args(["/run", "/tn", "rtaskmgr"]).creation_flags(0x0800_0000).status().is_ok_and(|s| s.success())
 }
 
@@ -198,6 +201,51 @@ pub fn relaunch_as_admin(args: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let (verb, path, params) = (wide("runas"), wide(&exe.to_string_lossy()), wide(args));
     unsafe { winapi::um::shellapi::ShellExecuteW(null_mut(), verb.as_ptr(), path.as_ptr(), params.as_ptr(), std::ptr::null(), 1) as usize > 32 }
+}
+
+// ---------- one running copy ----------
+// Closing the window may only hide it in the tray, and Ctrl+Shift+Esc starts a new process each time (IFEO, then the
+// scheduled task with MultipleInstances = Parallel). Without this every press added another hidden copy, and the
+// window the user had "closed" never came back. Now a second start brings the running one forward and quits.
+
+const INSTANCE: &str = "Local\\WinRust-rtaskmgr";
+
+/// The message a second start broadcasts so the running copy shows its window.
+pub fn show_msg() -> u32 {
+    unsafe { winapi::um::winuser::RegisterWindowMessageW(wide("WinRust.rtaskmgr.show").as_ptr()) }
+}
+
+/// Whether a copy already runs (checked without taking the name, so a launcher that only hops to the elevated task
+/// cannot make the real one think it is the second).
+pub fn running() -> bool {
+    use winapi::um::{errhandlingapi::GetLastError, handleapi::CloseHandle, synchapi::OpenMutexW, winnt::SYNCHRONIZE};
+    unsafe {
+        let h = OpenMutexW(SYNCHRONIZE, 0, wide(INSTANCE).as_ptr());
+        if !h.is_null() {
+            CloseHandle(h);
+            return true;
+        }
+        GetLastError() == winapi::shared::winerror::ERROR_ACCESS_DENIED // the elevated copy owns it
+    }
+}
+
+/// Takes the name for this process (held until it exits). false: another copy got there first.
+pub fn claim() -> bool {
+    use winapi::um::{errhandlingapi::GetLastError, synchapi::CreateMutexW};
+    unsafe {
+        let h = CreateMutexW(null_mut(), 0, wide(INSTANCE).as_ptr());
+        let e = GetLastError();
+        !(e == winapi::shared::winerror::ERROR_ALREADY_EXISTS || (h.is_null() && e == winapi::shared::winerror::ERROR_ACCESS_DENIED))
+    }
+}
+
+/// Asks the running copy to show its window (and lets it take the foreground).
+pub fn ask_running_to_show() {
+    use winapi::um::winuser::*;
+    unsafe {
+        AllowSetForegroundWindow(ASFW_ANY);
+        PostMessageW(HWND_BROADCAST, show_msg(), 0, 0);
+    }
 }
 
 // ---------- системный диспетчер задач ----------

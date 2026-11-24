@@ -276,9 +276,21 @@ impl App {
             GetClientRect(hwnd, &mut rc);
             let (w, h) = (rc.right, rc.bottom);
             if w > 0 && h > 0 {
-                let mem = winapi::um::wingdi::CreateCompatibleDC(hdc);
-                let bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
-                let old = winapi::um::wingdi::SelectObject(mem, bmp as *mut _);
+                thread_local! {
+                    static BUF: Cell<(winapi::shared::windef::HDC, winapi::shared::windef::HBITMAP, i32, i32)> = const { Cell::new((null_mut(), null_mut(), 0, 0)) };
+                }
+                let mem = BUF.with(|b| {
+                    let (mut dc, mut bmp, bw, bh) = b.get();
+                    if dc.is_null() || bw != w || bh != h {
+                        if !bmp.is_null() { winapi::um::wingdi::DeleteObject(bmp as *mut _); }
+                        if !dc.is_null() { winapi::um::wingdi::DeleteDC(dc); }
+                        dc = winapi::um::wingdi::CreateCompatibleDC(hdc);
+                        bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
+                        winapi::um::wingdi::SelectObject(dc, bmp as *mut _);
+                        b.set((dc, bmp, w, h));
+                    }
+                    dc
+                });
                 let g = G { dc: mem, s: self.scale, th: ui.th, fonts: &self.fonts };
                 let lay = self.compute_layout(&g, &ui, &d, w, h);
                 // прокрутка не должна выходить за содержимое
@@ -296,9 +308,6 @@ impl App {
                 self.draw_nav(&g, &ui, &lay);
                 self.draw_overlay(&g, &ui, lay.client);
                 winapi::um::wingdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, winapi::um::wingdi::SRCCOPY);
-                winapi::um::wingdi::SelectObject(mem, old);
-                winapi::um::wingdi::DeleteObject(bmp as *mut _);
-                winapi::um::wingdi::DeleteDC(mem);
                 if let Some(path) = layout_log_path() {
                     // только для автотестов: где лежат кнопки, шапка и первая строка (физические пиксели клиентской области)
                     let mut t = format!("scale={}\nrow0={:?}\nheader={:?}\n", self.scale, (lay.rows_area.l, lay.rows_area.t, lay.rows_area.r, lay.rows_area.b), (lay.header.l, lay.header.t, lay.header.r, lay.header.b));
@@ -703,6 +712,16 @@ impl App {
     }
 
     pub fn tick(&self) {
+        let seen = self.win.visible() && self.win.handle.hwnd().is_some_and(|h| unsafe { winapi::um::winuser::IsIconic(h as _) } == 0);
+        if !seen {
+            // Hidden in tray or minimized: skip heavy per-second sysinfo/PDH/EnumWindows polling; only surface boost notifications.
+            let notes = crate::boost::take_done();
+            if !notes.is_empty() {
+                let msg = notes.join("; ");
+                self.tray.show(&msg, Some(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas")), None, None);
+            }
+            return;
+        }
         {
             let ui = self.ui.borrow();
             self.data.borrow_mut().want_gpu_temp = ui.page == Page::Performance && matches!(ui.perf_sel, PerfKind::Gpu(_));
@@ -1227,11 +1246,9 @@ impl App {
     pub fn show_window(&self) {
         self.win.set_visible(true);
         if let Some(h) = self.win.handle.hwnd() {
-            unsafe {
-                ShowWindow(h, SW_RESTORE);
-                SetForegroundWindow(h);
-            }
+            winrust_common::fg::raise(h as _);
         }
+        self.tick();
     }
 
     pub fn quit(&self) {

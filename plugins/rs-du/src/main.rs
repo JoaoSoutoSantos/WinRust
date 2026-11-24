@@ -26,6 +26,19 @@ fn wipe(p: &Path) {
     }
 }
 
+/// A click into a console with QuickEdit on starts a text selection, and that pauses the program until Esc: the window looked
+/// frozen. The menu-launched console turns it off (Enter and typing still work).
+fn no_quick_edit() {
+    use windows_sys::Win32::System::Console::*;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut m = 0;
+        if GetConsoleMode(h, &mut m) != 0 {
+            SetConsoleMode(h, (m & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+    }
+}
+
 fn main() {
     let a: Vec<String> = env::args().skip(1).collect();
     let flag = |f: &str| a.iter().any(|x| x == f);
@@ -34,6 +47,10 @@ fn main() {
     let (top, depth, logical, json) = (val("--top", 20), val("--depth", 2), flag("--logical"), flag("--json"));
     if flag("--restore") { return clean::restore(drive); }
     if flag("--purge") { return clean::purge(drive, true); }
+    if flag("--ask") {
+        no_quick_edit();
+        println!("{}", tf!("Читаю диск {}: …", "Reading drive {}: …", ja: "ドライブ {}: を読み取り中…", pt: "Lendo o disco {}: …", drive));
+    }
     let t = std::time::Instant::now();
     let recs = scan(drive).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
     let tot = totals(&recs, logical);

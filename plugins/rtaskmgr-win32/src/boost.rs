@@ -24,9 +24,10 @@ pub enum Id {
     Defender,
     Ntfs,
     Dns,
+    Gaming,
 }
 
-pub const ALL: [Id; 9] = [Id::Game, Id::Work, Id::MemNow, Id::MemAuto, Id::Shell, Id::Updaters, Id::Defender, Id::Ntfs, Id::Dns];
+pub const ALL: [Id; 10] = [Id::Game, Id::Gaming, Id::Work, Id::MemNow, Id::MemAuto, Id::Shell, Id::Updaters, Id::Defender, Id::Ntfs, Id::Dns];
 
 impl Id {
     pub fn key(self) -> &'static str {
@@ -40,6 +41,7 @@ impl Id {
             Id::Defender => "defender",
             Id::Ntfs => "ntfs",
             Id::Dns => "dns",
+            Id::Gaming => "gaming",
         }
     }
     pub fn from_key(k: &str) -> Option<Id> {
@@ -56,6 +58,7 @@ impl Id {
             Id::Defender => t!("Исключения Defender для сборок и игр", "Defender exclusions for builds and games", ja: "ビルドとゲーム用の Defender 除外", pt: "Exclusões do Defender para compilações e jogos"),
             Id::Ntfs => t!("Быстрее NTFS", "Faster NTFS", ja: "高速 NTFS", pt: "NTFS mais rápido"),
             Id::Dns => t!("Блокировать рекламу (hosts)", "Block ads (hosts)", ja: "広告をブロック (hosts)", pt: "Bloquear anúncios (hosts)"),
+            Id::Gaming => t!("Максимум FPS в играх", "Maximum FPS in games", ja: "ゲームの FPS を最大化", pt: "FPS máximo em jogos"),
         }
     }
     pub fn desc(self) -> &'static str {
@@ -69,10 +72,11 @@ impl Id {
             Id::Defender => t!("Defender перестаёт проверять кэши cargo, rustup, npm, pip, NuGet, Gradle и библиотеки Steam/Epic, а также cargo.exe и rustc.exe. Сборка и загрузка игр быстрее, но эти папки не сканируются.", "Defender stops scanning the caches of cargo, rustup, npm, pip, NuGet, Gradle and the Steam/Epic libraries, and cargo.exe and rustc.exe. Builds and game loading get faster, but those folders are not scanned.", ja: "Defender は cargo、rustup、npm、pip、NuGet、Gradle、Steam/Epic ライブラリのキャッシュと、cargo.exe および rustc.exe のスキャンを停止します。ビルドとゲームの読み込みが速くなりますが、これらのフォルダーはスキャンされません。", pt: "O Defender deixa de verificar os caches de cargo, rustup, npm, pip, NuGet, Gradle e as bibliotecas do Steam/Epic, além de cargo.exe e rustc.exe. Compilações e carregamento de jogos ficam mais rápidos, mas essas pastas não são verificadas."),
             Id::Ntfs => t!("NTFS не пишет время последнего доступа при каждом чтении и не создаёт короткие имена 8.3. Действует после перезагрузки.", "NTFS stops writing the last-access time on every read and creating 8.3 short names. Takes effect after a reboot.", ja: "NTFS は読み取りのたびに最終アクセス日時を書き込むことと、8.3 形式の短い名前の作成をやめます。再起動後に有効になります。", pt: "O NTFS para de gravar o horário do último acesso a cada leitura e de criar nomes curtos 8.3. Vale após reiniciar."),
             Id::Dns => t!("Около 170 рекламных и следящих доменов ведут в никуда через файл hosts (домены Microsoft не трогаются).", "About 170 ad and tracker domains lead nowhere through the hosts file (Microsoft domains are left alone).", ja: "約 170 の広告・トラッカーのドメインを hosts ファイルで無効化します (Microsoft のドメインは対象外)。", pt: "Cerca de 170 domínios de anúncios e rastreadores não levam a lugar nenhum pelo arquivo hosts (domínios da Microsoft são preservados)."),
+            Id::Gaming => t!("Схема питания «Максимальная производительность», игровой режим, без фоновой записи Game DVR, аппаратное планирование GPU, приоритет MMCSS для игр, без сетевого и энергетического троттлинга. Выключение возвращает прежнюю схему и значения.", "Ultimate Performance power plan, Game Mode, no Game DVR background recording, hardware GPU scheduling, MMCSS priority for games, no network or power throttling. Disabling puts the old plan and values back.", ja: "電源プラン「究極のパフォーマンス」、ゲーム モード、Game DVR のバックグラウンド録画オフ、ハードウェア GPU スケジューリング、ゲーム向け MMCSS 優先度、ネットワークと電力のスロットリングなし。無効にすると元のプランと値に戻ります。", pt: "Plano de energia 'Desempenho Máximo', Modo de Jogo, sem gravação em segundo plano do Game DVR, agendamento de GPU por hardware, prioridade MMCSS para jogos, sem limitação de rede nem de energia. Desativar devolve o plano e os valores antigos."),
         }
     }
     fn debloat_group(self) -> Option<&'static str> {
-        matches!(self, Id::Updaters | Id::Defender | Id::Ntfs | Id::Dns).then(|| self.key())
+        matches!(self, Id::Updaters | Id::Defender | Id::Ntfs | Id::Dns | Id::Gaming).then(|| self.key())
     }
 }
 

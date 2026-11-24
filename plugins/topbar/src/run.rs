@@ -98,6 +98,16 @@ pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LR
                 }
                 return 1;
             }
+            // Win+V: Windows' clipboard history lives in Explorer's shell; without it the bar shows its own (hist.rs)
+            if !EXPLORER_UP.load(Relaxed) && k.vkCode == b'V' as u32 && (held(VK_LWIN) || held(VK_RWIN)) && !held(VK_CONTROL) && !held(VK_MENU) && !held(VK_SHIFT) {
+                if down0 {
+                    WIN_ALONE.store(false, Relaxed);
+                    keybd_event(0xE8, 0, 0, 0); // a key between Win down and up: no Start menu on release
+                    keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+                    PostMessageW(BAR.load(Relaxed) as HWND, hist::CLIPS, 0, 0);
+                }
+                return 1;
+            }
             let down = w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize;
             let bar = BAR.load(Relaxed) as HWND;
             // Alt+Tab: our own switcher. Without explorer Windows only flips to the next window blindly, and a fullscreen

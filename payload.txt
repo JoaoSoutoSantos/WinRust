@@ -13,3 +13,5 @@ photoview.exe = target/release/photoview.exe
 rust-settings.exe = target/release/rust-settings.exe
 debloat.exe = target/release/debloat.exe
 purge.exe = target/release/purge.exe
+rs-notepad.exe = target/release/rs-notepad.exe
+rs-calc.exe = target/release/rs-calc.exe

@@ -88,7 +88,12 @@ pub(crate) fn cli(args: &[String]) -> i32 {
         }
         ["update", n] => match find(n) {
             None => return { say(&format!("unknown plugin: {n}")); 2 },
-            Some(i) if !(PLUGINS[i].installed)() => return { say(&format!("{n} is not installed (use install)")); 2 },
+            Some(i) if !(PLUGINS[i].installed)() => return {
+                // also into install.log: started elevated through explorer, the console is gone and update-plugin.ps1 waited 5 min for nothing
+                log(&format!("{n}: not installed (use install)"));
+                say(&format!("{n} is not installed (use install)"));
+                2
+            },
             Some(i) => install_plugin(i),
         },
         ["uninstall", n] => match find(n) {

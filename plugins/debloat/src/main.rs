@@ -6,6 +6,8 @@
 //   defender   Defender exclusions for build caches and game libraries (opt-in: those folders are no longer scanned)
 //   ntfs       NTFS stops updating last-access times and creating 8.3 short names (after a reboot)
 //   dns        ad and tracker domains blocked in the hosts file
+//   gaming     Ultimate Performance power plan, Game Mode on, Game DVR capture off, GPU scheduling, MMCSS priority for games,
+//              no network throttling, no power throttling (undo puts the old plan and values back)
 // debloat --status <group>     prints on/off; exit code 0 = applied (its undo file exists)
 //
 // Only reversible things. Not touched on purpose: Windows Update, Print Spooler, Xbox/Game services, SysMain, installed apps,
@@ -102,6 +104,21 @@ const NTFS_REGS: &[(&str, &str, u32, &str)] = &[
     (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisable8dot3NameCreation", 1, "no 8.3 short name created with every new file"),
 ];
 
+const MMCSS: &str = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
+const GAME_REGS: &[(&str, &str, u32, &str)] = &[
+    (r"HKCU\Software\Microsoft\GameBar", "AutoGameModeEnabled", 1, "Game Mode: Windows gives the game CPU priority and holds back updates"),
+    (r"HKCU\Software\Microsoft\GameBar", "AllowAutoGameMode", 1, "Game Mode allowed"),
+    (r"HKCU\System\GameConfigStore", "GameDVR_Enabled", 0, "no background game recording"),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode", 2, "hardware-accelerated GPU scheduling (after a reboot, supported GPUs only)"),
+    (MMCSS, "SystemResponsiveness", 10, "MMCSS reserves 10% CPU for background instead of 20%"),
+    (MMCSS, "NetworkThrottlingIndex", 0xFFFF_FFFF, "no network throttling while media plays"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", 8, "games get the top MMCSS GPU priority"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Priority", 6, "games get a higher MMCSS CPU priority"),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling", "PowerThrottlingOff", 1, "no EcoQoS throttling of background-looking game threads"),
+];
+/// The hidden Ultimate Performance scheme; `powercfg -duplicatescheme` makes a visible copy of it.
+const ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+
 const DEF_PROCS: &[&str] = &["cargo.exe", "rustc.exe"];
 
 const HOSTS_BEGIN: &str = "# >>> WinRust DNS block >>>";
@@ -145,6 +162,7 @@ enum Group {
     Defender,
     Ntfs,
     Dns,
+    Gaming,
 }
 
 impl Group {
@@ -154,6 +172,7 @@ impl Group {
             "defender" => Group::Defender,
             "ntfs" => Group::Ntfs,
             "dns" => Group::Dns,
+            "gaming" => Group::Gaming,
             _ => return None,
         })
     }
@@ -164,14 +183,20 @@ impl Group {
             Group::Defender => "undo-defender.txt",
             Group::Ntfs => "undo-ntfs.txt",
             Group::Dns => "undo-dns.txt",
+            Group::Gaming => "undo-gaming.txt",
         }
     }
 }
 
 fn run(prog: &str, args: &[&str]) -> (bool, String) {
-    // HKCU = the signed-in user's when the installer was elevated as another administrator (WINRUST_SID)
-    let args: Vec<String> = if prog == "reg.exe" { winrust_common::reg::user_args(args) } else { args.iter().map(|a| a.to_string()).collect() };
-    match Command::new(prog).args(&args).output() {
+    if prog == "reg.exe" {
+        // HKCU = the signed-in user's when the installer was elevated as another administrator (WINRUST_SID)
+        return match winrust_common::regexe::exec(&winrust_common::reg::user_args(args)) {
+            Ok(s) => (true, s),
+            Err(e) => (false, e),
+        };
+    }
+    match Command::new(prog).args(args).output() {
         Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()),
         Err(e) => (false, e.to_string()),
     }
@@ -337,6 +362,7 @@ fn plan(g: Group) {
         Group::Base => (SERVICES, REGS),
         Group::Updaters => (UPD_SERVICES, &[]),
         Group::Ntfs => (&[], NTFS_REGS),
+        Group::Gaming => (&[], GAME_REGS),
         _ => (&[], &[]),
     };
     for (svc, why) in svcs {
@@ -371,6 +397,7 @@ fn plan(g: Group) {
             }
         }
         Group::Dns => println!("  hosts   {} ad/tracker domains -> 0.0.0.0", BLOCK.len()),
+        Group::Gaming => println!("  power   {} -> Ultimate Performance", active_scheme().unwrap_or_else(|| "?".into())),
         _ => {}
     }
 }
@@ -502,8 +529,47 @@ fn apply_dns(log: &mut Log) -> Result<u32, String> {
     Ok(!ok as u32)
 }
 
+/// The first GUID in `powercfg` output ("Power Scheme GUID: 381b4222-...  (Balanced)"; the label is localized).
+fn parse_guid(out: &str) -> Option<String> {
+    out.split_whitespace()
+        .find(|g| g.len() == 36 && g.matches('-').count() == 4 && g.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .map(str::to_lowercase)
+}
+
+fn active_scheme() -> Option<String> {
+    let (ok, out) = run("powercfg.exe", &["/getactivescheme"]);
+    if ok { parse_guid(&out) } else { None }
+}
+
+fn apply_gaming(log: &mut Log) -> Result<u32, String> {
+    let mut failed = apply_regs(GAME_REGS, log)?;
+    let Some(old) = active_scheme() else {
+        println!("FAILED  power plan: powercfg /getactivescheme");
+        return Ok(failed + 1);
+    };
+    let (ok, out) = run("powercfg.exe", &["-duplicatescheme", ULTIMATE]);
+    match parse_guid(&out).filter(|_| ok) {
+        Some(new) => {
+            log.line(&format!("power|{old}|{new}"))?;
+            let ok = run("powercfg.exe", &["/setactive", &new]).0;
+            failed += !ok as u32;
+            println!("{}  power plan: Ultimate Performance ({new})", if ok { "done  " } else { "FAILED" });
+        }
+        None => {
+            failed += 1;
+            println!("FAILED  power plan: Ultimate Performance is not available on this edition");
+        }
+    }
+    Ok(failed)
+}
+
 fn apply(g: Group) -> Result<(), String> {
     let path = undo_path(g);
+    if g == Group::Gaming && path.is_file() {
+        // a second apply would log the already-changed values as "original" and copy one more Ultimate Performance plan
+        println!("already applied (undo file {} exists)", path.display());
+        return Ok(());
+    }
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e} (run as admin)", dir.display()))?;
     let f = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -514,6 +580,7 @@ fn apply(g: Group) -> Result<(), String> {
         Group::Defender => apply_defender(&mut log)?,
         Group::Ntfs => apply_regs(NTFS_REGS, &mut log)?,
         Group::Dns => apply_dns(&mut log)?,
+        Group::Gaming => apply_gaming(&mut log)?,
     };
     drop(log);
     // nothing was changed (all skipped): no undo file, so the group does not show as applied
@@ -542,6 +609,11 @@ fn undo(g: Group) -> Result<(), String> {
             ["newtask", name] => run("schtasks.exe", &["/delete", "/tn", name, "/f"]).0 || task_enabled(name).is_none(),
             ["mpx", "path", p] => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionPath {}", psq(p))).0,
             ["mpx", "proc", p] => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionProcess {}", psq(p))).0,
+            ["power", old, new] => {
+                let ok = run("powercfg.exe", &["/setactive", old]).0;
+                let _ = run("powercfg.exe", &["/delete", new]);
+                ok
+            }
             ["hosts", "block"] => {
                 let p = hosts_path();
                 let ok = fs::read_to_string(&p).is_ok_and(|t| fs::write(&p, strip_block(&t)).is_ok());
@@ -568,7 +640,7 @@ fn main() {
         Some(g) => match Group::parse(g) {
             Some(g) => g,
             None => {
-                eprintln!("unknown group '{g}' (updaters, defender, ntfs, dns)");
+                eprintln!("unknown group '{g}' (updaters, defender, ntfs, dns, gaming)");
                 std::process::exit(2);
             }
         },
@@ -608,7 +680,7 @@ mod tests {
     #[test]
     fn every_registry_item_is_hkcu_or_hklm_and_unique() {
         let mut seen = std::collections::HashSet::new();
-        for (k, v, _, _) in REGS.iter().chain(NTFS_REGS) {
+        for (k, v, _, _) in REGS.iter().chain(NTFS_REGS).chain(GAME_REGS) {
             assert!(k.starts_with("HKLM\\") || k.starts_with("HKCU\\"), "{k}");
             assert!(seen.insert((k, v)), "duplicate {k} {v}");
         }
@@ -650,10 +722,17 @@ mod tests {
     }
 
     #[test]
+    fn power_scheme_guid() {
+        assert_eq!(parse_guid("Power Scheme GUID: 381B4222-F694-41F0-9685-FF5BB260DF2E  (Balanced)").as_deref(), Some("381b4222-f694-41f0-9685-ff5bb260df2e"));
+        assert_eq!(parse_guid("GUID do Esquema de Energia: e9a42b02-d5df-448d-aa00-03f14749eb61  (Desempenho)").as_deref(), Some(ULTIMATE));
+        assert_eq!(parse_guid("Unable to perform operation."), None);
+    }
+
+    #[test]
     fn groups_parse_and_have_own_files() {
-        let gs = ["updaters", "defender", "ntfs", "dns"].map(|g| Group::parse(g).unwrap());
+        let gs = ["updaters", "defender", "ntfs", "dns", "gaming"].map(|g| Group::parse(g).unwrap());
         let files: std::collections::HashSet<_> = gs.iter().map(|g| g.file()).chain([Group::Base.file()]).collect();
-        assert_eq!(files.len(), 5);
+        assert_eq!(files.len(), 6);
         assert_eq!(Group::parse("x"), None);
     }
 }

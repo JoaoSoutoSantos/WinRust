@@ -14,6 +14,7 @@ pub enum Kind {
     Cal,
     Start,
     Menu, // right-click menu of the bar
+    Widgets, // CPU / memory / disk / network, the month, the media playing
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -35,6 +36,9 @@ enum Act {
     App(usize), // index into the filtered list
     Power(u8),  // 0 lock, 1 sleep, 2 restart, 3 shut down
     Keyboard,   // the on-screen keyboard button in the Start search field
+    Media(u8),  // widgets: 0 previous, 1 play / pause, 2 next
+    WSettings,  // widgets: the gear (their page of the settings)
+    WCal,       // widgets: the month card opens the full calendar
 }
 
 /// The touch keyboard (TabTip), else the classic on-screen keyboard. Windows opens it by itself only for the Explorer shell.
@@ -89,6 +93,28 @@ fn phy_name(t: i32) -> &'static str {
 }
 
 static APPS: Mutex<Vec<(String, Vec<u16>)>> = Mutex::new(Vec::new()); // Start menu shortcuts: (name, .lnk path)
+static APPS_VER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const WM_APP_ICON: u32 = WM_APP + 50; // async icon worker -> Start flyout: wp = Box<(Vec<u16>, isize)>
+static ICON_TX: std::sync::OnceLock<std::sync::mpsc::Sender<(Vec<u16>, isize)>> = std::sync::OnceLock::new();
+
+fn queue_icon(lnk: Vec<u16>, hw: HWND) {
+    let tx = ICON_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u16>, isize)>();
+        std::thread::spawn(move || unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            while let Ok((path, h)) = rx.recv() {
+                let t = lnk_target(&path);
+                let ic = lnk_icon(&path, &t);
+                let payload = Box::into_raw(Box::new((path, ic as isize)));
+                if PostMessageW(h as HWND, WM_APP_ICON, payload as WPARAM, 0) == 0 {
+                    drop(Box::from_raw(payload));
+                }
+            }
+        });
+        tx
+    });
+    let _ = tx.send((lnk, hw as isize));
+}
 pub static PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // `--preview`: stays open without focus
 static BRIGHT: AtomicI32 = AtomicI32::new(-1); // -1 = no controllable display (desktop PC)
 const ROWS: usize = 11;
@@ -104,6 +130,7 @@ thread_local! {
     static CONNECTING: RefCell<Option<(String, u64)>> = const { RefCell::new(None) }; // the network being joined and since when: its row animates
     static CTX: RefCell<Option<(String, i32, i32, u64)>> = const { RefCell::new(None) }; // Wi-Fi right-click menu: network (by name: the list reorders), x, y (px), opened at
     static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static FILT_CACHE: RefCell<(String, u64, Vec<usize>)> = const { RefCell::new((String::new(), 0, Vec::new())) };
     static SCROLL: Cell<usize> = const { Cell::new(0) };
     static SELALL: Cell<bool> = const { Cell::new(false) }; // Ctrl+A in the search: the next key replaces the query
     static ICONS: RefCell<HashMap<Vec<u16>, HICON>> = RefCell::new(HashMap::new()); // by path: the app list is reloaded and reordered
@@ -155,6 +182,7 @@ pub fn load_apps() {
     v.sort_by_key(|a| a.0.to_lowercase());
     v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
     *APPS.lock().unwrap() = v;
+    APPS_VER.fetch_add(1, Relaxed);
 }
 
 /// (display name, app id) of everything in the shell's Apps folder (what the Windows Start menu lists).
@@ -230,6 +258,7 @@ fn pin_file() -> PathBuf {
 
 fn pinned_load() {
     *PINNED.lock().unwrap() = std::fs::read_to_string(pin_file()).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+    APPS_VER.fetch_add(1, Relaxed);
 }
 
 fn wstr(w: &[u16]) -> String {
@@ -295,6 +324,7 @@ pub fn start_toggle(path: &str) {
         None => p.push(path.to_string()),
     }
     let _ = std::fs::write(pin_file(), p.join("\n"));
+    APPS_VER.fetch_add(1, Relaxed);
 }
 
 static EXE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -328,6 +358,7 @@ fn find_loose_exes(hw: HWND) {
         }
         drop(apps);
         if added {
+            APPS_VER.fetch_add(1, Relaxed);
             unsafe { InvalidateRect(hw as HWND, null(), 0) };
         }
     });
@@ -335,6 +366,16 @@ fn find_loose_exes(hw: HWND) {
 
 fn filtered() -> Vec<usize> {
     let q = QUERY.with_borrow(|q| q.to_lowercase());
+    let ver = APPS_VER.load(Relaxed);
+    if let Some(hit) = FILT_CACHE.with_borrow(|c| (c.1 == ver && c.0 == q).then(|| c.2.clone())) {
+        return hit;
+    }
+    let out = filtered_uncached(&q);
+    FILT_CACHE.set((q, ver, out.clone()));
+    out
+}
+
+fn filtered_uncached(q: &str) -> Vec<usize> {
     let mut apps = APPS.lock().unwrap();
     if q.is_empty() {
         let pinned = PINNED.lock().unwrap();
@@ -494,7 +535,27 @@ unsafe fn read_one(h: HANDLE, g: &windows_sys::core::GUID) -> (Vec<Net>, Option<
     }
 }
 
+/// The last finished network scan, waiting for the UI thread (`take_nets`).
+static NETS_IN: Mutex<Option<(Vec<Net>, Option<Conn>)>> = Mutex::new(None);
+static NETS_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reads the networks in a thread (the WLAN calls can take a while with several adapters or a driver busy scanning);
+/// the open flyout repaints when they arrive. A read already running covers this request.
 unsafe fn read_nets() {
+    if NETS_BUSY.swap(true, Relaxed) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let r = unsafe { scan_nets() };
+        if let Ok(mut d) = NETS_IN.lock() {
+            *d = Some(r);
+        }
+        NETS_BUSY.store(false, Relaxed);
+        crate::status::post_status(3);
+    });
+}
+
+unsafe fn scan_nets() -> (Vec<Net>, Option<Conn>) {
     let mut nets: Vec<Net> = vec![];
     let mut conn: Option<Conn> = None;
     for_each_wlan(|h, g| {
@@ -513,6 +574,12 @@ unsafe fn read_nets() {
     });
     nets.sort_by_key(|n| (!n.connected, -n.q));
     nets.truncate(7);
+    (nets, conn)
+}
+
+/// Takes a finished scan (if any) into the flyout's state.
+unsafe fn take_nets() {
+    let Some((nets, conn)) = NETS_IN.lock().ok().and_then(|mut d| d.take()) else { return };
     NETS.set(nets);
     CONN.set(conn);
     // the joining animation ends when the network shows up as connected, or gives up after 25 s
@@ -585,11 +652,12 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 
 fn size(k: Kind) -> (i32, i32) {
     match k {
-        Kind::Quick => (360, 252 + 44 * sliders()),
+        Kind::Quick => (360, SLIDERS_Y + 68 + 44 * sliders()),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
         Kind::Menu => (MW, menu_rows().1),
+        Kind::Widgets => (WW, wid_rows().3),
     }
 }
 
@@ -613,6 +681,18 @@ fn wifi_rows() -> (Vec<(i32, i32)>, Option<i32>, i32) {
         }
         (rows, label, y + if n.is_empty() { 70 } else { 10 } + 44)
     })
+}
+
+// quick settings geometry, logical px: tiles are buttons TILE_W x TILE_H with their name under them, rows TILE_PITCH apart
+const TILE_W: i32 = 104;
+const TILE_H: i32 = 52;
+const TILE_PITCH: i32 = 98;
+const TILE_SPLIT: i32 = 62; // the Wi-Fi button: the toggle left of this, the network list right of it
+const SLIDERS_Y: i32 = 16 + 2 * TILE_PITCH; // top of the sliders card
+
+/// Top-left of quick tile `i` (3 per row).
+fn tile_at(i: u8) -> (i32, i32) {
+    (16 + (TILE_W + 8) * (i as i32 % 3), 16 + TILE_PITCH * (i as i32 / 3))
 }
 
 /// Quick settings: how many slider rows (volume, plus brightness on a laptop).
@@ -651,16 +731,17 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
     let (w, h) = size(k);
     match k {
         Kind::Quick => {
-            // a 3x2 grid of tiles; the Wi-Fi tile has a round "more" button in its corner (found first: act_at searches backwards)
+            // a 3x2 grid of buttons with their names under them; the Wi-Fi button is split: its right part opens the network
+            // list (found first: act_at searches backwards)
             let mut v = vec![];
             for i in 0..6u8 {
-                let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
-                v.push((r(tl, tt, tl + 104, tt + 76), Act::Tile(i)));
+                let (tl, tt) = tile_at(i);
+                v.push((r(tl, tt, tl + TILE_W, tt + TILE_H), Act::Tile(i)));
                 if i == 0 {
-                    v.push((r(tl + 66, tt + 8, tl + 96, tt + 38), Act::WifiMore));
+                    v.push((r(tl + TILE_SPLIT, tt, tl + TILE_W, tt + TILE_H), Act::WifiMore));
                 }
             }
-            let mut y = 188;
+            let mut y = SLIDERS_Y + 4;
             if BRIGHT.load(Relaxed) >= 0 {
                 v.push((r(64, y, w - 24, y + 40), Act::BrightSlide));
                 y += 44;
@@ -686,6 +767,17 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
         Kind::Menu => {
             let heads: Vec<bool> = MITEMS.with_borrow(|m| m.iter().map(|it| it.head).collect());
             menu_rows().0.into_iter().enumerate().filter(|(i, _)| !heads[*i]).map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect()
+        }
+        Kind::Widgets => {
+            let (_, cal, media, _) = wid_rows();
+            let mut v = vec![(r(w - 48, 12, w - 16, 44), Act::WSettings)];
+            if let Some(t) = cal {
+                v.push((r(16, t, w - 16, t + 228), Act::WCal));
+            }
+            if let Some(t) = media {
+                v.extend((0..3u8).map(|i| (r(w - 136 + 38 * i as i32, t + 22, w - 104 + 38 * i as i32, t + 54), Act::Media(i))));
+            }
+            v
         }
         Kind::Start => {
             let f = filtered();
@@ -726,6 +818,7 @@ pub struct MItem {
     pub swatch: u32, // a colour dot before the label (COLORREF), u32::MAX = none
 }
 
+#[allow(dead_code)]
 impl MItem {
     pub fn head(label: impl Into<String>) -> Self {
         MItem { head: true, ..MItem::new(label) }
@@ -799,33 +892,103 @@ fn menu_rows() -> (Vec<(i32, i32)>, i32) {
 
 /// Right-click menu of an empty spot of the bar.
 pub fn context_menu(x: i32) {
-    let pu = crate::purge_installed();
-    let mut items = vec![
-        MItem::new(t!("Параметры Windows", "Windows Settings", ja: "Windows の設定", pt: "Configurações do Windows")).hint("Win+I"),
-        MItem::new(t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização")),
-        MItem::new(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas")).hint("Ctrl+Shift+Esc").sep(),
-        MItem::new(t!("Чистильщик диска", "Disk Cleaner", ja: "ディスク クリーナー", pt: "Limpador de Disco")),
-        MItem::new(t!("Закрыть панель", "Close the bar", ja: "バーを閉じる", pt: "Fechar a barra")).danger().sep(),
+    #[derive(Clone, Copy)]
+    enum A { Settings, Personal, TaskMgr, FreeRam, Fps, Cleaner, Purge, Close }
+    let fps = crate::fps_state();
+    let mut acts = vec![
+        (A::Settings, MItem::new(t!("Параметры Windows", "Windows Settings", ja: "Windows の設定", pt: "Configurações do Windows")).hint("Win+I")),
+        (A::Personal, MItem::new(t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização"))),
+        (A::TaskMgr, MItem::new(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas")).hint("Ctrl+Shift+Esc").sep()),
+        (A::FreeRam, MItem::new(t!("Освободить оперативную память", "Free up RAM", ja: "RAM を解放", pt: "Liberar memória RAM"))),
     ];
-    if pu {
-        items.insert(4, MItem::new(t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)", ja: "Windows の不要なものを削除 (元に戻せません)", pt: "Remover lixo do Windows (irreversível)")).danger());
+    if let Some(on) = fps {
+        let label = if crate::fps_busy() {
+            t!("Режим «Максимум FPS»: переключаю…", "Maximum FPS mode: switching…", ja: "FPS 最大化モード: 切り替え中…", pt: "Modo FPS máximo: alternando…")
+        } else if on {
+            t!("Выключить режим «Максимум FPS»", "Turn off Maximum FPS mode", ja: "FPS 最大化モードをオフにする", pt: "Desligar modo FPS máximo")
+        } else {
+            t!("Включить режим «Максимум FPS»", "Turn on Maximum FPS mode", ja: "FPS 最大化モードをオンにする", pt: "Ligar modo FPS máximo")
+        };
+        acts.push((A::Fps, MItem::new(label).on(on)));
     }
+    acts.push((A::Cleaner, MItem::new(t!("Чистильщик диска", "Disk Cleaner", ja: "ディスク クリーナー", pt: "Limpador de Disco")).sep()));
+    if crate::purge_installed() {
+        acts.push((A::Purge, MItem::new(t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)", ja: "Windows の不要なものを削除 (元に戻せません)", pt: "Remover lixo do Windows (irreversível)")).danger()));
+    }
+    acts.push((A::Close, MItem::new(t!("Закрыть панель", "Close the bar", ja: "バーを閉じる", pt: "Fechar a barra")).danger().sep()));
+    let (ids, items): (Vec<A>, Vec<MItem>) = acts.into_iter().unzip();
     menu(x, None, items, move |i| unsafe {
-        let i = if pu && i == 4 { 99 } else { i };
-        match i {
-            0 => open(&wide("ms-settings:")),
-            1 => open(&wide("ms-settings:personalization")),
-            // with rtaskmgr-win32 installed this is our task manager; a full path because explorer.exe does not search PATH
-            2 => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
-            3 => open_cleaner(),
-            99 => crate::open_purge(),
-            _ => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
+        match ids.get(i).copied() {
+            Some(A::Settings) => open(&wide("ms-settings:")),
+            Some(A::Personal) => open(&wide("ms-settings:personalization")),
+            // `open` swaps in rtaskmgr-win32 when installed (apps::own_app); a full path because explorer.exe does not search PATH
+            Some(A::TaskMgr) => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
+            Some(A::FreeRam) => free_ram(x),
+            Some(A::Fps) => crate::fps_toggle(), // ignored while a switch runs
+            Some(A::Cleaner) => open_cleaner(),
+            Some(A::Purge) => crate::open_purge(),
+            Some(A::Close) => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
+            None => {}
         }
     });
 }
 
+/// The result of `free_ram`'s worker: (x of the menu, text), shown by `changed`.
+static RAM_DONE: Mutex<Option<(i32, String)>> = Mutex::new(None);
+
+/// Drops the standby list (the bar runs elevated) in a thread, as it can take seconds, then says how much memory became free.
+fn free_ram(x: i32) {
+    std::thread::spawn(move || {
+        let sub = free_ram_text();
+        if let Ok(mut d) = RAM_DONE.lock() {
+            *d = Some((x, sub));
+        }
+        crate::status::post_status(3);
+    });
+}
+
+/// A background read finished (STATUS 3 on the bar): take its result into the flyouts and repaint the open one.
+pub fn changed() {
+    if let Some((x, sub)) = RAM_DONE.lock().ok().and_then(|mut d| d.take()) {
+        let head = (null_mut(), "\u{E964}", t!("Память", "Memory", ja: "メモリ", pt: "Memória").to_string(), sub);
+        menu(x, Some(head), vec![MItem::new("OK")], |_| {});
+    }
+    unsafe { take_nets() };
+    let hw = FH.get();
+    if hw.is_null() {
+        return;
+    }
+    unsafe {
+        if FLY.get() == Some(Kind::Wifi) && PASS.with_borrow(|p| p.is_none()) {
+            let (w, h) = (sc(size(Kind::Wifi).0), sc(size(Kind::Wifi).1));
+            // the panel hangs above the bar: keep its bottom edge where it is and grow / shrink upward
+            let (x, _) = FIN.get();
+            let y = pop_y(h);
+            FIN.set((x, y));
+            SetWindowPos(hw, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowRgn(hw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(16), rr(16)), 1);
+        }
+        InvalidateRect(hw, null(), 0);
+    }
+}
+
+fn free_ram_text() -> String {
+    use winrust_common::mem;
+    let before = mem::lists();
+    let res = mem::purge_standby();
+    let mb = |b: u64| b >> 20;
+    match (res, before, mem::lists()) {
+        (Ok(()), Some(b), Some(a)) => tf!("Освобождено {} МБ, свободно {} МБ", "Freed {} MB, {} MB free now", ja: "{} MB を解放、空き {} MB", pt: "{} MB liberados, {} MB livres agora", mb(a.free.saturating_sub(b.free)), mb(a.free)),
+        (Ok(()), _, _) => t!("Кэш памяти очищен", "Memory cache cleared", ja: "メモリ キャッシュをクリアしました", pt: "Cache de memória limpo").into(),
+        (Err(st), _, _) => tf!("Не удалось (NTSTATUS 0x{:08X})", "Failed (NTSTATUS 0x{:08X})", ja: "失敗しました (NTSTATUS 0x{:08X})", pt: "Falhou (NTSTATUS 0x{:08X})", st as u32),
+    }
+}
+
 /// Starts the fade-out of the open flyout (it stays as a ghost window until the fade ends).
 pub fn close() {
+    if FLY.get() == Some(Kind::Widgets) {
+        crate::widgets::stop_media();
+    }
     if FLY.get().is_some() {
         LAST.set((FLY.get(), unsafe { now_ms() }));
     }
@@ -838,8 +1001,8 @@ pub fn close() {
         kill_ghost();
         GHOST.set((h, now_ms(), FIN.get()));
         KillTimer(h, 1);
-        KillTimer(h, 2);
-        SetTimer(h, 3, 15, None);
+        winrust_common::frames::stop(h, 2);
+        winrust_common::frames::start(h, 3);
     }
 }
 
@@ -861,7 +1024,7 @@ unsafe fn anim_step(hw: HWND) {
     let now = now_ms();
     let (g, gt0, gpos) = GHOST.get();
     if hw == g {
-        let t = (now.saturating_sub(gt0) as f32 / 150.0).min(1.0);
+        let t = if anim() { (now.saturating_sub(gt0) as f32 / 150.0).min(1.0) } else { 1.0 };
         let q = t * t;
         SetLayeredWindowAttributes(hw, 0, ((1.0 - q) * 255.0) as u8, LWA_ALPHA);
         SetWindowPos(hw, null_mut(), gpos.0, gpos.1 + (q * sc(10) as f32) as i32, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -869,16 +1032,16 @@ unsafe fn anim_step(hw: HWND) {
             kill_ghost();
         }
     } else if hw == FH.get() {
-        let t = (now.saturating_sub(T0.get()) as f32 / 220.0).min(1.0);
+        let t = if anim() { (now.saturating_sub(T0.get()) as f32 / 220.0).min(1.0) } else { 1.0 };
         let p = 1.0 - (1.0 - t).powi(3);
         SetLayeredWindowAttributes(hw, 0, (p * 255.0) as u8, LWA_ALPHA);
         let (x, y) = FIN.get();
         SetWindowPos(hw, null_mut(), x, y + ((1.0 - p) * sc(14) as f32) as i32, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         if t >= 1.0 {
-            KillTimer(hw, 3);
+            winrust_common::frames::stop(hw, 3);
         }
     } else {
-        KillTimer(hw, 3);
+        winrust_common::frames::stop(hw, 3);
     }
 }
 
@@ -907,13 +1070,16 @@ pub fn toggle(k: Kind) {
         CAL.set((t.wYear as i32, t.wMonth as i32));
         match k {
             Kind::Wifi => {
-                for_each_wlan(|h, g| _ = WlanScan(h, g, null(), null(), null()));
+                std::thread::spawn(|| for_each_wlan(|h, g| _ = WlanScan(h, g, null(), null(), null())));
                 read_nets();
             }
             Kind::Quick => {
                 read_brightness();
                 read_nets();
                 crate::quick::refresh();
+            }
+            Kind::Widgets => {
+                crate::widgets::sample(true);
             }
             Kind::Start => {
                 pinned_load(); // the search card (rs-launcher) can add to this list from another process
@@ -926,6 +1092,7 @@ pub fn toggle(k: Kind) {
         let x = if vert() { side_x(w) } else { match k {
             Kind::Start => (sw - w) / 2,
             Kind::Menu => MENU_X.get().min(sw - w - sc(8)).max(sc(8)),
+            Kind::Widgets => bar_x_w().0 + sc(8), // under its button, next to the gear
             _ => sw - w - sc(8),
         } };
         let class = wide("topbar_fly");
@@ -946,8 +1113,15 @@ pub fn toggle(k: Kind) {
         FLY.set(Some(k));
         ShowWindow(hw, SW_SHOW);
         force_fg(hw);
+        SetFocus(hw);
         SetTimer(hw, 1, 1000, None);
-        SetTimer(hw, 3, 15, None);
+        winrust_common::frames::start(hw, 3);
+        if k == Kind::Widgets {
+            crate::widgets::start_media(hw);
+        }
+        if k == Kind::Start {
+            SetTimer(hw, 4, 530, None); // blinking search caret
+        }
     }
 }
 
@@ -1028,7 +1202,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         Act::WifiMore => toggle(Kind::Wifi),
         Act::WifiSwitch => wifi_radio(WIFI.get() < 0 && NETS.with_borrow(|n| n.is_empty())),
         Act::Tile(i) => match i {
-            0 => wifi_radio(WIFI.get() < 0),
+            0 => wifi_radio(WIFI.get() < 0 && NETS.with_borrow(|n| n.is_empty())), // the tile is lit while the radio is on
             5 => {
                 close();
                 keys(&[VK_LWIN, VK_CONTROL, b'L' as u16]); // live captions
@@ -1062,7 +1236,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                     _ => crate::quick::set_keys(true, !filter),
                 });
             }
-            _ => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
+            _ => crate::quick::set_energy_saver(!crate::quick::eco()),
         },
         Act::Mute => toggle_mute(),
         Act::Menu(i) => {
@@ -1082,6 +1256,12 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             (y, m) = if m < 1 { (y - 1, 12) } else if m > 12 { (y + 1, 1) } else { (y, m) };
             CAL.set((y, m));
         }
+        Act::Media(i) => crate::widgets::media_cmd(i),
+        Act::WSettings => {
+            close_now();
+            crate::settings::open_widgets_page();
+        }
+        Act::WCal => toggle(Kind::Cal),
         Act::CalToday => {
             let mut t: SYSTEMTIME = zeroed();
             GetLocalTime(&mut t);
@@ -1204,6 +1384,35 @@ fn inset(rc: RECT, d: i32) -> RECT {
     RECT { left: rc.left + d, top: rc.top + d, right: rc.right - d, bottom: rc.bottom - d }
 }
 
+thread_local! {
+    static FLY_FONTS: RefCell<((i32, &'static str, &'static str), [HFONT; 6])> = RefCell::new(((0, "", ""), [null_mut(); 6]));
+}
+
+unsafe fn fly_fonts() -> [HFONT; 6] {
+    let key = (sc(100), ui_face(), winrust_common::style::icon_face());
+    FLY_FONTS.with_borrow_mut(|c| {
+        if c.0 != key || c.1[0].is_null() {
+            for f in c.1 {
+                if !f.is_null() {
+                    DeleteObject(f);
+                }
+            }
+            let (face, gface) = (wide(key.1), wide(key.2));
+            let font = |f: &[u16], px: i32, wt: i32| CreateFontW(-sc(px), 0, 0, 0, wt, 0, 0, 0, 1, 0, 0, 5, 0, f.as_ptr());
+            c.1 = [
+                font(&face, 13, 400),
+                font(&face, 12, 400),
+                font(&gface, 16, 400),
+                font(&face, 15, 600),
+                font(&face, 13, 600),
+                font(&gface, 11, 400),
+            ];
+            c.0 = key;
+        }
+        c.1
+    })
+}
+
 unsafe fn paint(hw: HWND, k: Kind) {
     let mut ps: PAINTSTRUCT = zeroed();
     let wdc = BeginPaint(hw, &mut ps);
@@ -1216,10 +1425,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
     fill(dc, inset(cr, 1), pal().bg, sc(16));
     winrust_common::style::backdrop(dc, inset(cr, 1), sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
-    let (face, gface) = (wide(ui_face()), wide(winrust_common::style::icon_face()));
-    let font = |f: &[u16], px: i32, wt: i32| CreateFontW(-sc(px), 0, 0, 0, wt, 0, 0, 0, 1, 0, 0, 5, 0, f.as_ptr());
-    let (f_txt, f_small, f_glyph, f_title, f_big) = (font(&face, 13, 400), font(&face, 12, 400), font(&gface, 16, 400), font(&face, 15, 600), font(&face, 34, 600));
-    let (f_semi, f_head, f_gs, f_label) = (font(&face, 13, 600), font(&face, 18, 700), font(&gface, 11, 400), font(&face, 12, 600));
+    let [f_txt, f_small, f_glyph, f_title, f_semi, f_gs] = fly_fonts();
     let card = card();
     let of = SelectObject(dc, f_txt);
     let (w, h) = size(k);
@@ -1233,61 +1439,52 @@ unsafe fn paint(hw: HWND, k: Kind) {
         Kind::Quick => {
             let rs = rects(k);
             let q = WIFI.get();
-            let ssid = NETS.with_borrow(|n| n.iter().find(|n| n.connected).map(|n| n.ssid.clone()));
-            let wsub = match (q >= 0, ssid) {
-                (true, Some(s)) => s,
-                (true, None) => t!("Подключено", "Connected", ja: "接続済み", pt: "Conectado").into(),
-                _ if NETS.with_borrow(|n| n.is_empty()) => t!("Выключен", "Off", ja: "オフ", pt: "Desligado").into(),
-                _ => t!("Не подключено", "Not connected", ja: "未接続", pt: "Não conectado").into(),
-            };
-            let (bt, air, acc, eco) = (crate::quick::bluetooth(), crate::quick::airplane(), crate::quick::accessibility_on(), crate::quick::energy_saver());
-            let onoff = |b: Option<bool>| match b {
-                Some(true) => t!("Вкл.", "On", ja: "オン", pt: "Ligado").to_string(),
-                Some(false) => t!("Выкл.", "Off", ja: "オフ", pt: "Desligado").to_string(),
-                None => t!("Нет", "None", ja: "なし", pt: "Nenhum").to_string(),
-            };
-            let states = [q >= 0, bt == Some(true), air == Some(true), acc, eco, false];
+            // states only from caches (the workers of `quick` and `read_nets` fill them): painting never waits on Windows.
+            // The details (network name, devices) live in the panels the tiles open, not on the tiles.
+            let (bt, air, acc, eco) = (crate::quick::bluetooth(), crate::quick::airplane(), crate::quick::acc(), crate::quick::eco());
+            let wifi_on = q >= 0 || NETS.with_borrow(|n| !n.is_empty());
+            let states = [wifi_on, bt == Some(true), air == Some(true), acc, eco, false];
             let tiles = [
-                ("\u{E701}", "Wi‑Fi".to_string(), wsub),
-                ("\u{E702}", "Bluetooth".to_string(), onoff(bt)),
-                ("\u{E709}", t!("Авиарежим", "Airplane mode", ja: "機内モード", pt: "Modo avião").to_string(), onoff(air)),
-                ("\u{E776}", t!("Спец. возможности", "Accessibility", ja: "アクセシビリティ", pt: "Acessibilidade").to_string(), onoff(Some(acc))),
-                ("\u{E945}", t!("Экономия энергии", "Energy saver", ja: "省エネ", pt: "Economia de energia").to_string(), onoff(Some(eco))),
-                ("\u{E7F0}", t!("Субтитры", "Live captions", ja: "ライブ キャプション", pt: "Legendas ao vivo").to_string(), String::new()),
+                ("\u{E701}", "Wi‑Fi"),
+                ("\u{E702}", "Bluetooth"),
+                ("\u{E709}", t!("Авиарежим", "Airplane mode", ja: "機内モード", pt: "Modo avião")),
+                ("\u{E776}", t!("Спец. возможности", "Accessibility", ja: "アクセシビリティ", pt: "Acessibilidade")),
+                ("\u{E945}", t!("Экономия энергии", "Energy saver", ja: "省エネ", pt: "Economia de energia")),
+                ("\u{E7F0}", t!("Субтитры", "Live captions", ja: "ライブ キャプション", pt: "Legendas ao vivo")),
             ];
-            for (i, (glyph, label, sub)) in tiles.iter().enumerate() {
-                let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
-                let full = r(tl, tt, tl + 104, tt + 76);
+            for (i, &(glyph, label)) in tiles.iter().enumerate() {
+                let (tl, tt) = tile_at(i as u8);
+                let btn = r(tl, tt, tl + TILE_W, tt + TILE_H);
                 let on = states[i];
-                let base = if on { mix(card, pal().accent, 0.12) } else { card };
-                surface(dc, full, base, sc(18));
-                g(Act::Tile(i as u8), inset(full, 1), base, mix(base, pal().text, 0.05), sc(16));
-                // the round icon badge: lit in the accent when on
-                let badge = r(tl + 12, tt + 12, tl + 44, tt + 44);
-                fill(dc, badge, if on { pal().accent } else { mix(card, pal().text, 0.08) }, sc(32));
+                let base = if on { pal().accent } else { card };
                 let ink = if on { on_accent() } else { pal().text };
+                surface(dc, btn, base, sc(12));
                 if i == 0 {
-                    // the same arcs as the bar: lit by the signal, a cross when not connected
-                    wifi_glyph(dc, (badge.left + badge.right) / 2, (badge.top + badge.bottom) / 2 - sc(1), sc(15), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, if on { pal().accent } else { card }, 0.55), if q < 0 { 1 } else { 0 });
-                    let more = rs.iter().find(|(_, a)| *a == Act::WifiMore).unwrap().0;
-                    g(Act::WifiMore, more, base, mix(base, pal().text, 0.1), sc(30));
+                    // split button: the toggle with the signal arcs, a hairline, the chevron to the network list
+                    let left = r(tl, tt, tl + TILE_SPLIT, tt + TILE_H);
+                    let more = r(tl + TILE_SPLIT, tt, tl + TILE_W, tt + TILE_H);
+                    g(Act::Tile(0), inset(left, 1), base, mix(base, ink, 0.08), sc(11));
+                    g(Act::WifiMore, inset(more, 1), base, mix(base, ink, 0.1), sc(11));
+                    wifi_glyph(dc, (left.left + left.right) / 2, (left.top + left.bottom) / 2 - sc(1), sc(16), if q >= 0 { arcs_lit(q) } else if wifi_on { 3 } else { 0 }, ink, mix(ink, base, 0.55), if wifi_on && q < 0 { 1 } else { 0 });
+                    fill(dc, RECT { left: more.left, top: more.top + sc(14), right: more.left + 1, bottom: more.bottom - sc(14) }, mix(base, ink, 0.3), 0);
                     SelectObject(dc, f_gs);
-                    text(dc, "\u{E76C}", more, pal().dim, DT_CENTER);
+                    text(dc, "\u{E76C}", more, ink, DT_CENTER);
                 } else {
+                    g(Act::Tile(i as u8), inset(btn, 1), base, mix(base, ink, 0.08), sc(11));
                     SelectObject(dc, f_glyph);
-                    text(dc, glyph, badge, ink, DT_CENTER);
+                    text(dc, glyph, btn, ink, DT_CENTER);
                 }
-                SelectObject(dc, f_label);
-                text(dc, label.as_str(), r(tl + 12, tt + 46, tl + 102, tt + 62), pal().text, DT_LEFT);
-                if !sub.is_empty() {
-                    SelectObject(dc, f_small);
-                    text(dc, sub, r(tl + 12, tt + 61, tl + 100, tt + 75), pal().dim, DT_LEFT);
-                }
+                // the name under the button: centred, wrapping to a second line instead of being cut
+                SelectObject(dc, f_small);
+                SetTextColor(dc, if i == 1 && bt.is_none() { pal().dim } else { pal().text });
+                let mut lr = r(tl - 2, tt + TILE_H + 6, tl + TILE_W + 2, tt + TILE_PITCH - 4);
+                let lw = wide(label);
+                DrawTextW(dc, lw.as_ptr(), -1, &mut lr, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
             }
             // sliders sit together on one card
             let n = sliders();
-            surface(dc, r(16, 184, w - 16, 192 + 44 * n), card, sc(18));
-            let mut y = 188;
+            surface(dc, r(16, SLIDERS_Y, w - 16, SLIDERS_Y + 8 + 44 * n), card, sc(18));
+            let mut y = SLIDERS_Y + 4;
             let b = BRIGHT.load(Relaxed);
             if b >= 0 {
                 SelectObject(dc, f_glyph);
@@ -1425,7 +1622,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     for (i, n) in nets.iter().enumerate() {
                         let rc = rs[i].0;
                         // rows fade in one after another when the panel opens
-                        let t = ease(((age - 40.0 * i as f32) / 220.0).clamp(0.0, 1.0));
+                        let t = if anim() { ease(((age - 40.0 * i as f32) / 220.0).clamp(0.0, 1.0)) } else { 1.0 };
                         if t < 1.0 {
                             BUSY.set(true);
                         }
@@ -1514,7 +1711,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
             // the right-click menu unfolds downward from where it was opened
             if let Some((ssid, mx, my, t0)) = CTX.with_borrow(|c| c.clone()) {
                 let items = ctx_items(&ssid);
-                let t = ease((now_ms().saturating_sub(t0) as f32 / 150.0).min(1.0));
+                let t = if anim() { ease((now_ms().saturating_sub(t0) as f32 / 150.0).min(1.0)) } else { 1.0 };
                 if t < 1.0 {
                     BUSY.set(true);
                 }
@@ -1599,15 +1796,25 @@ unsafe fn paint(hw: HWND, k: Kind) {
             });
         }
         Kind::Start => {
-            surface(dc, r(20, 20, w - 20, 56), card, sc(36));
+            // Focus ring + pill so the search bar clearly looks active as soon as it opens
+            fill(dc, r(19, 19, w - 19, 57), pal().accent, sc(38));
+            fill(dc, r(21, 21, w - 21, 55), card, sc(34));
             SelectObject(dc, f_glyph);
-            text(dc, "\u{E721}", r(28, 20, 56, 56), pal().dim, DT_CENTER);
+            text(dc, "\u{E721}", r(28, 20, 56, 56), pal().accent, DT_CENTER);
             SelectObject(dc, f_txt);
             let q = QUERY.with_borrow(|q| q.clone());
+            let mut caret_x = sc(64);
             if q.is_empty() {
                 text(dc, "Type to search apps", r(64, 20, w - 64, 56), pal().dim, DT_LEFT);
             } else {
                 text(dc, &q, r(64, 20, w - 64, 56), if SELALL.get() { pal().accent } else { pal().text }, DT_LEFT);
+                let wq = wide(&q);
+                let mut sz: SIZE = zeroed();
+                GetTextExtentPoint32W(dc, wq.as_ptr(), (wq.len() - 1) as i32, &mut sz);
+                caret_x = (sc(64) + sz.cx + sc(1)).min(sc(w - 66));
+            }
+            if !SELALL.get() && (now_ms() / 530) % 2 == 0 {
+                fill(dc, RECT { left: caret_x, top: sc(29), right: caret_x + sc(2).max(1), bottom: sc(47) }, pal().accent, 0);
             }
             if let Some((kr, ka)) = rects(k).into_iter().find(|(_, a)| *a == Act::Keyboard) {
                 g(ka, kr, card, mix(card, pal().text, 0.1), sc(14));
@@ -1647,10 +1854,13 @@ unsafe fn paint(hw: HWND, k: Kind) {
                             fill(dc, RECT { left: rc.left, top: rc.top + sc(10), right: rc.left + sc(3), bottom: rc.bottom - sc(10) }, pal().accent, sc(3));
                         }
                         let ic = ICONS.with_borrow_mut(|m| {
-                            *m.entry(app.1.clone()).or_insert_with(|| {
-                                let t = lnk_target(&app.1);
-                                lnk_icon(&app.1, &t)
-                            })
+                            if let Some(&ic) = m.get(&app.1) {
+                                ic
+                            } else {
+                                m.insert(app.1.clone(), null_mut());
+                                queue_icon(app.1.clone(), hw);
+                                null_mut()
+                            }
                         });
                         if !ic.is_null() {
                             DrawIconEx(dc, rc.left + sc(13), (rc.top + rc.bottom - icon_px()) / 2, ic, icon_px(), icon_px(), 0, null_mut(), DI_NORMAL); // at its loaded size: no stretching
@@ -1681,20 +1891,18 @@ unsafe fn paint(hw: HWND, k: Kind) {
             };
             text(dc, &hint, r(24, h - 52, w - 200, h - 12), pal().dim, DT_LEFT);
         }
+        Kind::Widgets => paint_widgets(dc, w, over, [f_txt, f_small, f_glyph, f_title, f_semi]),
     }
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
-    for f in [f_txt, f_small, f_glyph, f_title, f_big, f_semi, f_head, f_gs, f_label] {
-        DeleteObject(f);
-    }
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
     if BUSY.get() {
-        SetTimer(hw, 2, 16, None); // next animation frame
+        winrust_common::frames::start(hw, 2); // next animation frame
     } else {
-        KillTimer(hw, 2);
+        winrust_common::frames::stop(hw, 2);
     }
     EndPaint(hw, &ps);
 }
@@ -1732,19 +1940,20 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
         }
         WM_DROPFILES => on_files(hw, wp as HDROP),
-        WM_TIMER if wp == 2 => {
+        WM_APP_ICON => {
+            let (path, ic) = *Box::from_raw(wp as *mut (Vec<u16>, isize));
+            ICONS.with_borrow_mut(|m| { m.insert(path, ic as HICON); });
+            InvalidateRect(hw, null(), 0);
+        }
+        WM_TIMER if wp == 2 || wp == 4 => {
             InvalidateRect(hw, null(), 0);
         }
         WM_TIMER => {
+            if k == Kind::Widgets {
+                crate::widgets::sample(true);
+            }
             if k == Kind::Wifi && PASS.with_borrow(|p| p.is_none()) {
-                read_nets();
-                let (w, h) = (sc(size(k).0), sc(size(k).1));
-                // the panel hangs above the bar: keep its bottom edge where it is and grow / shrink upward
-                let (x, _) = FIN.get();
-                let y = pop_y(h);
-                FIN.set((x, y));
-                SetWindowPos(hw, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-                SetWindowRgn(hw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(16), rr(16)), 1);
+                read_nets(); // `changed` fits the panel to the list when it arrives
             }
             InvalidateRect(hw, null(), 0);
         }
@@ -1896,5 +2105,196 @@ mod tests {
         assert_eq!(score("calculator", "xyz"), None);
         assert_eq!(score("calculator", ""), None);
         assert_eq!(score("v", "v"), Some(0)); // one-letter initials do not count, the prefix does
+    }
+}
+
+// ---------- widgets panel ----------
+
+const WW: i32 = 380; // widgets panel width, logical px
+
+/// Widgets panel in logical px: the metric cards that are on ((0 CPU, 1 memory, 2 disk, 3 network), left, top), the top of
+/// the month card and of the media card, and the panel height.
+fn wid_rows() -> (Vec<(u8, i32, i32)>, Option<i32>, Option<i32>, i32) {
+    use i18n::style::{Flag, flag};
+    let mut y = 56;
+    let on: Vec<u8> = [Flag::WCpu, Flag::WRam, Flag::WDisk, Flag::WNet].iter().enumerate().filter(|(_, f)| flag(**f)).map(|(i, _)| i as u8).collect();
+    let cards: Vec<_> = on.iter().enumerate().map(|(i, &m)| (m, 16 + (i as i32 % 2) * 182, y + (i as i32 / 2) * 96)).collect();
+    y += 96 * ((on.len() as i32 + 1) / 2);
+    let cal = flag(Flag::WCal).then(|| {
+        y += 236;
+        y - 236
+    });
+    let media = flag(Flag::WMedia).then(|| {
+        y += 84;
+        y - 84
+    });
+    if on.is_empty() && cal.is_none() && media.is_none() {
+        y += 48; // room for the "everything is off" hint
+    }
+    (cards, cal, media, y + 8)
+}
+
+/// COLORREF -> GDI+ ARGB with alpha `a`.
+fn argb(c: u32, a: u32) -> u32 {
+    a << 24 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255)
+}
+
+/// A minute of `v` (scaled to `top`) as an anti-aliased line over a faint fill, in `rc`.
+unsafe fn sparkline(dc: HDC, rc: RECT, v: &[f32], top: f32, c: u32) {
+    use windows_sys::Win32::Graphics::GdiPlus::{GdipAddPathLine2, GdipDrawLines, PointF};
+    if v.len() < 2 || top <= 0.0 {
+        fill(dc, RECT { top: rc.bottom - sc(1), ..rc }, mix(card(), pal().text, 0.12), 0);
+        return;
+    }
+    let mut g: *mut GpGraphics = null_mut();
+    if GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
+        return;
+    }
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    let (w, h) = ((rc.right - rc.left) as f32, (rc.bottom - rc.top) as f32);
+    let step = w / (crate::widgets::HIST - 1) as f32;
+    let x0 = rc.right as f32 - step * (v.len() - 1) as f32; // the newest sample sits at the right edge
+    let mut pts: Vec<PointF> = v.iter().enumerate().map(|(i, &y)| PointF { X: x0 + step * i as f32, Y: rc.bottom as f32 - h * (y / top).clamp(0.0, 1.0) }).collect();
+    let line = pts.clone();
+    pts.push(PointF { X: rc.right as f32, Y: rc.bottom as f32 });
+    pts.push(PointF { X: x0, Y: rc.bottom as f32 });
+    let mut path: *mut GpPath = null_mut();
+    GdipCreatePath(FillModeAlternate, &mut path);
+    GdipAddPathLine2(path, pts.as_ptr(), pts.len() as i32);
+    GdipClosePathFigure(path);
+    let mut br: *mut GpSolidFill = null_mut();
+    GdipCreateSolidFill(argb(c, 48), &mut br);
+    GdipFillPath(g, br as *mut GpBrush, path);
+    GdipDeleteBrush(br as *mut GpBrush);
+    GdipDeletePath(path);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(argb(c, 255), sc(2) as f32 * 0.75, UnitPixel, &mut pen);
+    GdipDrawLines(g, pen, line.as_ptr(), line.len() as i32);
+    GdipDeletePen(pen);
+    GdipDeleteGraphics(g);
+}
+
+/// Formats a date with a Windows picture string in the user's language ("MMMM yyyy", "ddd").
+unsafe fn date_pic(y: i32, m: i32, d: i32, pic: &str) -> String {
+    let t = SYSTEMTIME { wYear: y as u16, wMonth: m as u16, wDay: d as u16, ..zeroed() };
+    let mut b = [0u16; 64];
+    let n = GetDateFormatW(0x0400, 0, &t, wide(pic).as_ptr(), b.as_mut_ptr(), 64).max(1) as usize - 1;
+    String::from_utf16_lossy(&b[..n])
+}
+
+unsafe fn paint_widgets(dc: HDC, w: i32, over: Option<Act>, f: [HFONT; 5]) {
+    let [f_txt, f_small, f_glyph, f_title, f_semi] = f;
+    let hot = |a: Act| over == Some(a);
+    let g = |a: Act, rc: RECT, from: u32, to: u32, rad: i32| glow(dc, rc.top * 4096 + rc.left + 1_000_000, hot(a), rc, from, to, rad);
+    let card = card();
+    SelectObject(dc, f_title);
+    text(dc, t!("Виджеты", "Widgets", ja: "ウィジェット", pt: "Widgets"), r(18, 12, w - 60, 44), pal().text, DT_LEFT);
+    let gear = r(w - 48, 12, w - 16, 44);
+    g(Act::WSettings, gear, pal().bg, pal().hover, sc(8));
+    SelectObject(dc, f_glyph);
+    text(dc, "\u{E713}", gear, pal().dim, DT_CENTER);
+
+    let (cards, cal, media, _) = wid_rows();
+    if cards.is_empty() && cal.is_none() && media.is_none() {
+        SelectObject(dc, f_small);
+        text(dc, t!("Все виджеты выключены в настройках", "Every widget is off in the settings", ja: "すべてのウィジェットが設定でオフです", pt: "Todos os widgets estão desligados nas configurações"), r(18, 56, w - 18, 96), pal().dim, DT_LEFT);
+    }
+    crate::widgets::with(|s| {
+        for &(m, l, t) in &cards {
+            let rc = r(l, t, l + 166, t + 86);
+            surface(dc, rc, card, sc(12));
+            let last = |v: &Vec<f32>| v.last().copied().unwrap_or(0.0);
+            let peak = |v: &Vec<f32>| v.iter().fold(64.0 * 1024.0f32, |a, &b| a.max(b)) * 1.15; // the scale never drops under 64 KB/s
+            let (label, value, sub, series, top, col): (&str, String, String, &Vec<f32>, f32, u32) = match m {
+                0 => (t!("ЦП", "CPU", ja: "CPU", pt: "CPU"), format!("{:.0}%", last(&s.cpu) * 100.0), String::new(), &s.cpu, 1.0, load_col((last(&s.cpu) * 100.0) as u8)),
+                1 => (t!("Память", "Memory", ja: "メモリ", pt: "Memória"), format!("{:.0}%", last(&s.ram) * 100.0), format!("{:.1} / {:.0} GB", s.ram_gb.0, s.ram_gb.1), &s.ram, 1.0, load_col((last(&s.ram) * 100.0) as u8)),
+                2 => (t!("Диск", "Disk", ja: "ディスク", pt: "Disco"), crate::widgets::rate(last(&s.disk)), format!("C: {:.0} / {:.0} GB", s.c_drive.0, s.c_drive.1), &s.disk, peak(&s.disk), pal().accent),
+                _ => (t!("Сеть", "Network", ja: "ネットワーク", pt: "Rede"), crate::widgets::rate(last(&s.net)), format!("↓ {}  ↑ {}", crate::widgets::rate(s.net_io.0), crate::widgets::rate(s.net_io.1)), &s.net, peak(&s.net), pal().accent),
+            };
+            SelectObject(dc, f_small);
+            text(dc, label, RECT { left: rc.left + sc(12), top: rc.top + sc(8), right: rc.right - sc(10), bottom: rc.top + sc(26) }, pal().dim, DT_LEFT);
+            SelectObject(dc, f_semi);
+            text(dc, &value, RECT { left: rc.left + sc(12), top: rc.top + sc(6), right: rc.right - sc(12), bottom: rc.top + sc(28) }, pal().text, DT_RIGHT);
+            SelectObject(dc, f_small);
+            text(dc, &sub, RECT { left: rc.left + sc(12), top: rc.top + sc(26), right: rc.right - sc(12), bottom: rc.top + sc(44) }, mix(pal().dim, pal().text, 0.2), DT_LEFT);
+            sparkline(dc, RECT { left: rc.left + sc(10), top: rc.top + sc(46), right: rc.right - sc(10), bottom: rc.bottom - sc(8) }, series, top, col);
+        }
+    });
+
+    if let Some(t) = cal {
+        let rc = r(16, t, w - 16, t + 228);
+        surface(dc, rc, card, sc(12));
+        g(Act::WCal, inset(rc, 1), card, mix(card, pal().text, 0.03), sc(12));
+        let mut now: SYSTEMTIME = zeroed();
+        GetLocalTime(&mut now);
+        let (y, m) = (now.wYear as i32, now.wMonth as i32);
+        SelectObject(dc, f_semi);
+        text(dc, &date_pic(y, m, 1, "MMMM yyyy"), RECT { left: rc.left + sc(14), top: rc.top + sc(8), right: rc.right - sc(14), bottom: rc.top + sc(34) }, pal().text, DT_LEFT);
+        let cw = (rc.right - rc.left - sc(24)) / 7;
+        let x0 = rc.left + sc(12);
+        SelectObject(dc, f_small);
+        for i in 0..7 {
+            // 1 January 2024 was a Monday: its week gives the day names in the user's language
+            let d = date_pic(2024, 1, 1 + i, "ddd");
+            text(dc, &d, RECT { left: x0 + cw * i, top: rc.top + sc(38), right: x0 + cw * (i + 1), bottom: rc.top + sc(58) }, pal().dim, DT_CENTER);
+        }
+        let tt = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+        let yy = if m < 3 { y - 1 } else { y };
+        let first = ((yy + yy / 4 - yy / 100 + yy / 400 + tt[m as usize - 1] + 1) % 7 + 6) % 7; // Monday = 0
+        let days = match m {
+            2 => if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        SelectObject(dc, f_txt);
+        for d in 1..=days {
+            let (col, row) = ((first + d - 1) % 7, (first + d - 1) / 7);
+            let top = rc.top + sc(60) + sc(27) * row;
+            let cell = RECT { left: x0 + cw * col, top, right: x0 + cw * (col + 1), bottom: top + sc(26) };
+            let today = d == now.wDay as i32;
+            if today {
+                let c = (cell.left + cell.right) / 2;
+                fill(dc, RECT { left: c - sc(13), right: c + sc(13), ..cell }, pal().accent, sc(26));
+            }
+            text(dc, &d.to_string(), cell, if today { on_accent() } else if col >= 5 { pal().dim } else { pal().text }, DT_CENTER);
+        }
+    }
+
+    if let Some(t) = media {
+        let rc = r(16, t, w - 16, t + 76);
+        surface(dc, rc, card, sc(12));
+        let art = RECT { left: rc.left + sc(12), top: rc.top + sc(14), right: rc.left + sc(60), bottom: rc.bottom - sc(14) };
+        fill(dc, art, mix(card, pal().accent, 0.22), sc(10));
+        SelectObject(dc, f_glyph);
+        text(dc, "\u{E8D6}", art, pal().accent, DT_CENTER);
+        let m = crate::widgets::media();
+        let tr = rc.right - sc(136);
+        let (title, sub) = match &m {
+            Some(m) => (m.title.clone(), [m.artist.as_str(), m.app.as_str()].iter().filter(|x| !x.is_empty()).copied().collect::<Vec<_>>().join(" · ")),
+            None => (t!("Ничего не играет", "Nothing playing", ja: "再生中のメディアはありません", pt: "Nada tocando").to_string(), String::new()),
+        };
+        SelectObject(dc, f_semi);
+        text(dc, &title, RECT { left: art.right + sc(12), top: rc.top + sc(16), right: tr, bottom: rc.top + sc(38) }, if m.is_some() { pal().text } else { pal().dim }, DT_LEFT);
+        SelectObject(dc, f_small);
+        text(dc, &sub, RECT { left: art.right + sc(12), top: rc.top + sc(38), right: tr, bottom: rc.top + sc(58) }, pal().dim, DT_LEFT);
+        let playing = m.as_ref().is_some_and(|m| m.playing);
+        SelectObject(dc, f_glyph);
+        for i in 0..3u8 {
+            let b = r(w - 136 + 38 * i as i32, t + 22, w - 104 + 38 * i as i32, t + 54);
+            let main = i == 1;
+            if main && m.is_some() {
+                fill(dc, b, pal().accent, sc(32));
+            } else {
+                g(Act::Media(i), b, card, mix(card, pal().text, 0.10), sc(32));
+            }
+            let glyph = match i {
+                0 => "\u{E892}",
+                1 if playing => "\u{E769}",
+                1 => "\u{E768}",
+                _ => "\u{E893}",
+            };
+            let c = if m.is_none() { mix(pal().dim, card, 0.4) } else if main { on_accent() } else { pal().text };
+            text(dc, glyph, b, c, DT_CENTER);
+        }
     }
 }

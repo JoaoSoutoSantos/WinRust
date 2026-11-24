@@ -6,4 +6,4 @@ $root = Split-Path $PSScriptRoot
 & "$PSScriptRoot\build-plugins.ps1"
 Push-Location $root
 try { cargo build --release -p plugin-launcher; if ($LASTEXITCODE) { throw 'launcher build failed' } } finally { Pop-Location }
-Write-Host "done: $root\target\release\plugin-launcher.exe"
+Write-Host "done: $(& "$PSScriptRoot\target-dir.ps1")\release\plugin-launcher.exe"

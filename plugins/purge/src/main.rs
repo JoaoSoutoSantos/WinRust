@@ -172,7 +172,7 @@ fn apply(od: bool, edge: bool) -> Result<(), String> {
         match edge_setup() {
             // Windows only lets Edge go outside the EU when this value exists
             Some(p) => {
-                let _ = run("reg", &["add", r"HKLM\SOFTWARE\Microsoft\EdgeUpdateDev", "/v", "AllowUninstall", "/t", "REG_SZ", "/d", "", "/f"]);
+                let _ = winrust_common::regexe::exec(&["add", r"HKLM\SOFTWARE\Microsoft\EdgeUpdateDev", "/v", "AllowUninstall", "/t", "REG_SZ", "/d", "", "/f"]);
                 did("Edge (best effort, Windows may refuse)".into(), run(&p.display().to_string(), &["--uninstall", "--system-level", "--verbose-logging", "--force-uninstall"]).0)
             }
             None => println!("skip     Edge: not present"),

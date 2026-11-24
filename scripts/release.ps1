@@ -19,7 +19,8 @@ $dir = Join-Path $env:TEMP "winrust-release-$Version"
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
 New-Item -ItemType Directory $dir | Out-Null
 $exe = Join-Path $dir 'WinRust.exe'
-Copy-Item "$root\target\release\plugin-launcher.exe" $exe -Force
+$tgt = & "$PSScriptRoot\target-dir.ps1" # cargo's real output folder (a global build.target-dir moves it out of the repo)
+Copy-Item "$tgt\release\plugin-launcher.exe" $exe -Force
 $sha = { param($p) (Get-FileHash $p -Algorithm SHA256).Hash.ToLower() }
 # manifest names are the payload.txt names; the asset gets dots for spaces (GitHub would rename it that way anyway)
 $lines = @('winrust-manifest 1', "version $Version", "$(& $sha $exe) WinRust.exe")
@@ -29,7 +30,7 @@ foreach ($f in Get-ChildItem "$root\payload\*.exe") {
 }
 $manifest = Join-Path $dir 'manifest.txt'
 [IO.File]::WriteAllText($manifest, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding $false))
-& "$root\target\release\winrust-sign.exe" sign $manifest (Join-Path $dir 'manifest.sig')
+& "$tgt\release\winrust-sign.exe" sign $manifest (Join-Path $dir 'manifest.sig')
 if ($LASTEXITCODE) { throw 'signing failed: is the key in %USERPROFILE%\.winrust\update-signing.key?' }
 $assets = @(Get-ChildItem $dir | ForEach-Object FullName)
 if ($OnlyInstaller) { $assets = @($exe) }

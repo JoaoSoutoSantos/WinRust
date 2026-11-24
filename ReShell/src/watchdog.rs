@@ -59,7 +59,11 @@ pub fn run() {
             if let Ok(exe) = std::env::current_exe() {
                 let topbar = exe.with_file_name("topbar.exe");
                 let _ = Command::new(&topbar).arg("--restore").creation_flags(0x0800_0000).status();
-                let _ = Command::new(&topbar).creation_flags(0x0800_0000).spawn(); // detached: the bar outlives this call
+                // Prefer the scheduled task so topbar keeps -RunLevel Highest (UIPI access to elevated tray icons); fall back to direct spawn.
+                let via_task = Command::new("schtasks").args(["/run", "/tn", "topbar"]).creation_flags(0x0800_0000).status().is_ok_and(|s| s.success());
+                if !via_task {
+                    let _ = Command::new(&topbar).creation_flags(0x0800_0000).spawn(); // detached: the bar outlives this call
+                }
             }
         }
     }

@@ -149,6 +149,26 @@ const PLUGINS: &[Plugin] = &[
         glyph: "\u{E713}", // settings
     },
     Plugin {
+        name: "rs-notepad",
+        desc: Tr("Лёгкий Блокнот на Win32: UTF-8/UTF-16/ANSI, CRLF/LF/CR, поиск и замена, перенос строк, масштаб, недавние файлы, открывает файлы 100+ МБ без подвисаний.", "Lightweight Win32 Notepad: UTF-8/UTF-16/ANSI, CRLF/LF/CR, find/replace, word wrap, zoom, recent files, opens 100 MB+ files without freezing.", "軽量 Win32 メモ帳: UTF-8/UTF-16/ANSI、CRLF/LF/CR、検索と置換、折り返し、拡大縮小、最近使ったファイル、100 MB 超のファイルもフリーズせず開きます。", "Bloco de Notas Win32 leve: UTF-8/UTF-16/ANSI, CRLF/LF/CR, localizar/substituir, quebra de linha, zoom, arquivos recentes, abre arquivos de 100 MB+ sem travar."),
+        warn: Tr("Запуск notepad.exe будет перенаправлен на rs-notepad (системный файл не трогается), добавляется ярлык «WinRust Notepad» и пункт в «Открыть с помощью» для txt/log/ini/md/csv/json/xml.", "Launching notepad.exe will be redirected to rs-notepad (the system file is untouched); adds a 'WinRust Notepad' shortcut and 'Open with' entries for txt/log/ini/md/csv/json/xml.", "notepad.exe の起動は rs-notepad にリダイレクトされます (システム ファイルは変更されません)。「WinRust Notepad」ショートカットと txt/log/ini/md/csv/json/xml の「プログラムから開く」項目を追加します。", "A execução do notepad.exe será redirecionada para o rs-notepad (o arquivo do sistema não é alterado); adiciona o atalho 'WinRust Notepad' e entradas em 'Abrir com' para txt/log/ini/md/csv/json/xml."),
+        installed: np_installed,
+        actions: Some((np_install, np_uninstall)),
+        settings: false,
+        bulk: true,
+        glyph: "\u{E70B}", // edit
+    },
+    Plugin {
+        name: "rs-calc",
+        desc: Tr("Калькулятор на Rust: обычный режим и режим программиста (HEX/DEC/OCT/BIN, побитовые операции), история вычислений, ввод с клавиатуры.", "A calculator in Rust: Standard and Programmer modes (HEX/DEC/OCT/BIN, bitwise ops), history, keyboard input.", "Rust 製の電卓: 標準モードとプログラマー モード (HEX/DEC/OCT/BIN、ビット演算)、履歴、キーボード入力。", "Uma calculadora em Rust: modos Padrão e Programador (HEX/DEC/OCT/BIN, operações bit a bit), histórico e entrada por teclado."),
+        warn: Tr("Запуск calc.exe будет перенаправлен на rs-calc (системный файл не трогается), создастся ярлык «WinRust Calculator». Калькулятор из Store, открытый с панели, из поиска, клавишей калькулятора или через ms-calculator:, тоже откроет rs-calc: без Проводника в роли оболочки приложения Store не запускаются.", "Launching calc.exe will be redirected to rs-calc (the system file is untouched) and a 'WinRust Calculator' shortcut is created. The Store Calculator opened from the bar, the search, the Calculator key or ms-calculator: opens rs-calc too: Store apps cannot start without Explorer as the shell.", "calc.exe の起動は rs-calc にリダイレクトされ (システム ファイルは変更されません)、「WinRust Calculator」ショートカットが作成されます。バー、検索、電卓キー、ms-calculator: から開く Store 版電卓も rs-calc で開きます: エクスプローラーがシェルでないと Store アプリは起動できません。", "A execução do calc.exe será redirecionada para o rs-calc (o arquivo do sistema não é alterado) e o atalho 'WinRust Calculator' será criado. A Calculadora da Store aberta pela barra, pela busca, pela tecla Calculadora ou por ms-calculator: também abre o rs-calc: apps da Store não iniciam sem o Explorer como shell."),
+        installed: calc_installed,
+        actions: Some((calc_install, calc_uninstall)),
+        settings: false,
+        bulk: true,
+        glyph: "\u{E8EF}", // calculator
+    },
+    Plugin {
         name: "debloat",
         desc: Tr("Отключает мусор Windows: телеметрию, Copilot, Recall, рекламу в Пуске, фон Edge. Только обратимое, старые значения запоминаются.", "Disables Windows junk: telemetry, Copilot, Recall, Start menu ads, the Edge background. Reversible changes only, old values are remembered.", "Windows の不要なものを無効にします: テレメトリ、Copilot、Recall、スタート メニューの広告、Edge のバックグラウンド動作。元に戻せる変更のみで、元の値は記憶されます。", "Desativa o lixo do Windows: telemetria, Copilot, Recall, anúncios no menu Iniciar, o segundo plano do Edge. Apenas alterações reversíveis; os valores antigos são lembrados."),
         warn: Tr("Будут ОТКЛЮЧЕНЫ несколько служб (телеметрия, карты, отчёты об ошибках, диагностика и средства устранения неполадок, AI Fabric) и выставлены политики реестра (Copilot, Recall, реклама, фон Edge; Edge покажет «управляется организацией»). Старые значения сохраняются, uninstall debloat возвращает всё. Приложения не удаляются.", "Several services will be DISABLED (telemetry, maps, error reporting, diagnostics and troubleshooters, AI Fabric) and registry policies set (Copilot, Recall, ads, Edge background; Edge will show 'managed by your organization'). Old values are saved, uninstall debloat restores everything. No apps are removed.", "いくつかのサービス (テレメトリ、マップ、エラー報告、診断とトラブルシューティング ツール、AI Fabric) が無効になり、レジストリ ポリシー (Copilot、Recall、広告、Edge のバックグラウンド動作) が設定されます (Edge には「組織によって管理されています」と表示されます)。元の値は保存され、debloat をアンインストールするとすべて元に戻ります。アプリは削除されません。", "Vários serviços serão DESATIVADOS (telemetria, mapas, relatório de erros, diagnósticos e solucionadores de problemas, AI Fabric) e políticas de registro serão definidas (Copilot, Recall, anúncios, segundo plano do Edge; o Edge mostrará 'gerenciado pela sua organização'). Os valores antigos são salvos; desinstalar o debloat restaura tudo. Nenhum app é removido."),

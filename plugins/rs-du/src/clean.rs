@@ -236,6 +236,9 @@ pub fn restore(drive: char) {
 }
 
 pub fn clean(recs: &HashMap<u32, Rec>, tot: &HashMap<u32, u64>, drive: char, apply: bool, ask: bool, all: bool, safe_only: bool) {
+    if ask {
+        println!("{}", t!("Считаю, что можно удалить…", "Measuring what can be removed…", ja: "削除できるものを計測中…", pt: "Calculando o que pode ser removido…"));
+    }
     let mut items = rules();
     let (proj, pb) = projects(recs, tot, drive);
     items.push(Item { risk: Risk::Rebuild, how: How::Remove, label: t!("Папки сборки проектов (target, node_modules)", "Project build folders (target, node_modules)", ja: "プロジェクトのビルド フォルダー (target、node_modules)", pt: "Pastas de compilação de projetos (target, node_modules)").into(), note: t!("Пересоберутся при следующей сборке или npm install.", "They are rebuilt on the next build or npm install.", ja: "次回のビルドまたは npm install で再作成されます。", pt: "São recriadas na próxima compilação ou npm install."), paths: proj, bytes: pb });

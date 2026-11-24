@@ -271,6 +271,8 @@ fn tile_color(name: &str) -> u32 {
         "photoview" => rgb(255, 55, 95),
         "debloat" => rgb(100, 210, 255),
         "purge" => rgb(255, 69, 58),
+        "rs-calc" => rgb(255, 149, 0),
+        "rs-notepad" => rgb(52, 199, 89),
         _ => rgb(142, 142, 147),
     }
 }

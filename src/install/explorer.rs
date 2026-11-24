@@ -24,7 +24,10 @@ pub(crate) const RX_SWITCH: &str = r"HKCU\Software\rs-shell";
 pub(crate) const RX_FOLDERS: [&str; 3] = [r"HKCU\Software\Classes\Directory\shell\open", r"HKCU\Software\Classes\Folder\shell\open", r"HKCU\Software\Classes\Drive\shell\open"];
 
 // The original DWORDs are saved in the installer's HKLM state key before changing them.
-const RX_SVCS: [(&str, u32); 5] = [("PcaSvc", 4), ("InventorySvc", 4), ("lfsvc", 4), ("cbdhsvc", 4), ("DoSvc", 3)];
+// Keep cbdhsvc (clipboard history) and DoSvc (Delivery Optimization / Store) untouched on new installs;
+// LEGACY_SVCS ensures uninstall still restores them if an older version backed them up.
+const RX_SVCS: [(&str, u32); 3] = [("PcaSvc", 4), ("InventorySvc", 4), ("lfsvc", 4)];
+const LEGACY_SVCS: [&str; 2] = ["cbdhsvc", "DoSvc"];
 const SPLIT_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control";
 const SPLIT_VALUE: &str = "SvcHostSplitThresholdInKB";
 
@@ -99,7 +102,8 @@ fn apply_service_trim() {
 fn restore_service_trim() -> Result<(), String> {
     let mut restored = false;
     let mut errors = Vec::new();
-    for (backup, key, value, _) in trim_settings() {
+    let legacy = LEGACY_SVCS.into_iter().map(|s| (s, svc_key(s), "Start", 0));
+    for (backup, key, value, _) in trim_settings().chain(legacy) {
         match restore((&key, value), (RX_STATE, backup), trim_read, trim_write) {
             Ok(saved) => restored |= saved,
             Err(e) => errors.push(e),

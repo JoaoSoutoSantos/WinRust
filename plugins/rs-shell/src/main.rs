@@ -26,8 +26,7 @@ fn quiet(program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 fn reg(args: &[&str]) -> Option<String> {
-    let o = Command::new("reg").args(args).creation_flags(NO_WINDOW).output().ok()?;
-    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    winrust_common::regexe::exec(args).ok()
 }
 
 /// Commands from `reg query <Run key>` output: "    Name    REG_SZ    command line".
@@ -181,6 +180,14 @@ fn log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.txt")) { let _ = writeln!(f, "[{t}] {msg}"); }
 }
 
+/// Starts topbar via its elevated scheduled task when available so UIPI allows clicking elevated tray icons; falls back to direct spawn.
+fn spawn_topbar() -> std::io::Result<()> {
+    if quiet("schtasks").args(["/run", "/tn", "topbar"]).creation_flags(NO_WINDOW).status().is_ok_and(|s| s.success()) {
+        return Ok(());
+    }
+    quiet(find_exe("topbar.exe")).spawn().map(|_| ())
+}
+
 fn run_shell() {
     unsafe { windows_sys::Win32::System::Console::FreeConsole() };
     log("start");
@@ -198,8 +205,8 @@ fn run_shell() {
     }
     thread::sleep(Duration::from_secs(4)); // topbar may already have been started by its own Run entry
     set_wallpaper();
-    // no bar yet (its logon task is gone in user mode): start it and its hotkey helper from our folder, with our normal rights
-    if !bar_up() { log(&format!("topbar spawn -> {:?}", quiet(find_exe("topbar.exe")).spawn().map(|_| ()))); }
+    // no bar yet (its logon task is gone in user mode): start it and its hotkey helper from our folder
+    if !bar_up() { log(&format!("topbar spawn -> {:?}", spawn_topbar())); }
     let hotkeys = find_exe("reshell.exe"); // lives in topbar's folder, not ours
     if hotkeys.exists() { log(&format!("reshell spawn -> {:?}", quiet(&hotkeys).spawn().map(|_| ()))); }
     let desktop = dir().join("rust-explorer.exe");
@@ -237,7 +244,7 @@ fn supervise() {
         if misses >= 6 { // ~6 s: the loop ticks every second now
             if since.elapsed() > Duration::from_secs(120) { (starts, since) = (0, Instant::now()); }
             starts += 1;
-            if starts > 3 || quiet(find_exe("topbar.exe")).spawn().is_err() {
+            if starts > 3 || spawn_topbar().is_err() {
                 // topbar will not stay up: hand the session to explorer so the user is never left with nothing
                 let _ = quiet(find_exe("topbar.exe")).arg("--restore").creation_flags(NO_WINDOW).status();
                 let _ = quiet("explorer.exe").spawn();
@@ -265,8 +272,8 @@ fn kill_shell_explorer() {
 }
 
 /// How long after the overlay starts Explorer may be ended even without the markers below: newer Windows builds (26300)
-/// no longer write them, and the overlay then waited forever. Explorer gets through the autostart well within this.
-const AUTOSTART_GRACE: Duration = Duration::from_secs(90);
+/// no longer write them, and the overlay then waited forever. 30s covers logon autostart + untracked shortcuts without holding Explorer 90s.
+const AUTOSTART_GRACE: Duration = Duration::from_secs(30);
 
 /// True once Explorer has started this session's Run keys and Startup folder. The overlay starts at logon (a scheduled task),
 /// before Explorer gets to them: ending Explorer earlier would lose the user's autostart apps.
@@ -321,17 +328,18 @@ fn overlay() {
     let replace = replace_on();
     log(&format!("overlay start (replace explorer: {replace})"));
     let wp = thread::spawn(set_wallpaper); // makes sure the BMP the desktop window paints exists (and refreshes the wallpaper)
-    if !bar_up() { log(&format!("topbar spawn -> {:?}", quiet(find_exe("topbar.exe")).spawn().map(|_| ()))); }
+    if !bar_up() { log(&format!("topbar spawn -> {:?}", spawn_topbar())); }
     // Win+I / Win+E / Win+D live in reshell: its Run entry may be missing (another account's HKCU), and without it Explorer's own Win+I
     // fails once the shell is gone. A second copy exits at once (one hook per session).
     let hk = find_exe("reshell.exe");
-    if hk.exists() { log(&format!("reshell spawn -> {:?}", quiet(&hk).spawn().map(|_| ()))); }
+    let has_reshell = hk.exists();
+    if has_reshell { log(&format!("reshell spawn -> {:?}", quiet(&hk).spawn().map(|_| ()))); }
     let _ = wp.join(); // the BMP conversion (only on a fresh install or a new wallpaper) finishes before the desktop paints it
     let desktop = dir().join("rust-explorer.exe");
     let up = || unsafe { !FindWindowW(wide("Progman").as_ptr(), wide("rs-desktop").as_ptr()).is_null() };
     if desktop.exists() && !up() { log(&format!("desktop spawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ()))); }
-    if replace {
-        // Explorer is being replaced: this thread watches, the main one owns Win+D / Win+E
+    if replace && !has_reshell {
+        // Only register fallback Win+D / Win+E hotkeys here when reshell is absent (avoid duplicate hotkey stack).
         thread::spawn(move || overlay_watch(replace, desktop, up));
         hotkey_loop();
     } else {
@@ -365,7 +373,7 @@ fn overlay_watch(replace: bool, desktop: PathBuf, up: impl Fn() -> bool) {
         misses += 1;
         if misses < 2 { continue; }
         starts += 1;
-        if starts > 3 || quiet(find_exe("topbar.exe")).spawn().is_err() {
+        if starts > 3 || spawn_topbar().is_err() {
             // the bar will not stay up: give the system's taskbar (and, if we ended it, Explorer) back and stop
             let _ = quiet(find_exe("topbar.exe")).arg("--restore").creation_flags(NO_WINDOW).status();
             if replace { start_shell_explorer(); }
@@ -454,8 +462,8 @@ mod tests {
     fn ends_explorer_on_markers_or_after_grace() {
         let s = Duration::from_secs;
         assert!(may_end_explorer(true, Duration::ZERO, false, 0));
-        assert!(!may_end_explorer(false, s(30), false, 0)); // something still missing
-        assert!(may_end_explorer(false, s(90), false, 3)); // grace over, whatever is missing
+        assert!(!may_end_explorer(false, s(15), false, 0)); // something still missing
+        assert!(may_end_explorer(false, s(30), false, 3)); // grace over, whatever is missing
         // everything we watch is running: after Explorer's startup delay, longer with shortcuts we cannot watch
         assert!(!may_end_explorer(false, s(9), true, 0));
         assert!(may_end_explorer(false, s(15), true, 0));

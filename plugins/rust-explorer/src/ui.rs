@@ -495,7 +495,26 @@ unsafe fn glow(dc: HDC, key: i32, r: RECT, base: u32, to: u32, rad: i32, on: boo
     if t > 0.01 || p > 0.0 { fill(dc, r, mix(mix(base, to, t), pal().accent, 0.45 * p), rad); }
 }
 
+unsafe fn offscreen_dc(slot: &'static std::thread::LocalKey<Cell<(HDC, HBITMAP, i32, i32)>>, wdc: HDC, w: i32, h: i32) -> HDC {
+    let (w, h) = (w.max(1), h.max(1));
+    slot.with(|b| {
+        let (mut dc, mut bmp, bw, bh) = b.get();
+        if dc.is_null() || bw != w || bh != h {
+            if !bmp.is_null() { DeleteObject(bmp); }
+            if !dc.is_null() { DeleteDC(dc); }
+            dc = CreateCompatibleDC(wdc);
+            bmp = CreateCompatibleBitmap(wdc, w, h);
+            SelectObject(dc, bmp);
+            b.set((dc, bmp, w, h));
+        }
+        dc
+    })
+}
+
 unsafe fn paint_chrome(hwnd: HWND) {
+    thread_local! {
+        static CHROME_BUF: Cell<(HDC, HBITMAP, i32, i32)> = const { Cell::new((ptr::null_mut(), ptr::null_mut(), 0, 0)) };
+    }
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let wdc = BeginPaint(hwnd, &mut ps);
     let mut cr: RECT = std::mem::zeroed();
@@ -504,8 +523,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     let snap = ST.with(|c| c.try_borrow().ok().map(|s| (s.tabs.iter().map(label).collect::<Vec<_>>(), s.active, s.hist.pos > 0, s.hist.pos + 1 < s.hist.v.len(), s.thumbs, s.edit, s.dir.clone())));
     let Some((labels, active, can_back, can_fwd, thumbs, edit, dir)) = snap else { EndPaint(hwnd, &ps); return };
     BUSY.set(false);
-    let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, cr.bottom));
-    let old = SelectObject(dc, bmp);
+    let dc = offscreen_dc(&CHROME_BUF, wdc, cr.right, cr.bottom);
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
@@ -513,7 +531,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     SetBkMode(dc, TRANSPARENT as i32);
     let l = layout(cr.right, labels.len());
     let hot = HOT.get();
-    let (f_txt, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(12, 400, winrust_common::style::icon_face()) as HFONT);
+    let [f_txt, _, f_glyph, f_small, _] = ui_fonts();
     let of = SelectObject(dc, f_txt);
 
     // tabs
@@ -598,11 +616,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     fill(dc, rc(0, cr.bottom - 1, cr.right, cr.bottom), pal().line, 0); // hairline under the chrome
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
-    for f in [f_txt, f_glyph, f_small] { DeleteObject(f); }
-    SelectObject(dc, old);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    if BUSY.get() { SetTimer(hwnd, 4, 16, None); } else { KillTimer(hwnd, 4); }
+    if BUSY.get() { winrust_common::frames::start(hwnd, 4); } else { winrust_common::frames::stop(hwnd, 4); }
     EndPaint(hwnd, &ps);
 }
 
@@ -854,20 +868,48 @@ fn nav_hit(y: i32) -> Option<usize> {
     })
 }
 
+thread_local! {
+    static UI_FONTS: RefCell<((i32, &'static str, &'static str), [HFONT; 5])> = RefCell::new(((0, "", ""), [ptr::null_mut(); 5]));
+}
+
+unsafe fn ui_fonts() -> [HFONT; 5] {
+    let key = (sc(100), ui_face(), winrust_common::style::icon_face());
+    UI_FONTS.with_borrow_mut(|c| {
+        if c.0 != key || c.1[0].is_null() {
+            for f in c.1 {
+                if !f.is_null() {
+                    DeleteObject(f);
+                }
+            }
+            c.1 = [
+                font(13, 400, key.1) as HFONT,
+                font(12, 600, key.1) as HFONT,
+                font(16, 400, key.2) as HFONT,
+                font(12, 400, key.2) as HFONT,
+                font(11, 400, key.1) as HFONT,
+            ];
+            c.0 = key;
+        }
+        c.1
+    })
+}
+
 unsafe fn paint_nav(hwnd: HWND) {
+    thread_local! {
+        static NAV_BUF: Cell<(HDC, HBITMAP, i32, i32)> = const { Cell::new((ptr::null_mut(), ptr::null_mut(), 0, 0)) };
+    }
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let wdc = BeginPaint(hwnd, &mut ps);
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut cr);
     BUSY.set(false);
-    let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right.max(1), cr.bottom.max(1)));
-    let old = SelectObject(dc, bmp);
+    let dc = offscreen_dc(&NAV_BUF, wdc, cr.right, cr.bottom);
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
     winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
-    let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
+    let [f_txt, f_head, f_glyph, _, f_small] = ui_fonts();
     let of = SelectObject(dc, f_txt);
     // where we are = the deepest item that contains the current folder
     let cur = ST.with(|c| c.try_borrow().ok().map(|s| s.dir.to_string_lossy().to_lowercase())).unwrap_or_default();
@@ -910,11 +952,7 @@ unsafe fn paint_nav(hwnd: HWND) {
     fill(dc, rc(cr.right - 1, 0, cr.right, cr.bottom), pal().line, 0); // hairline between the pane and the list
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
-    for f in [f_txt, f_head, f_glyph, f_small] { DeleteObject(f); }
-    SelectObject(dc, old);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    if BUSY.get() { SetTimer(hwnd, 4, 16, None); } else { KillTimer(hwnd, 4); }
+    if BUSY.get() { winrust_common::frames::start(hwnd, 4); } else { winrust_common::frames::stop(hwnd, 4); }
     EndPaint(hwnd, &ps);
 }
 

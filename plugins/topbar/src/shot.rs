@@ -11,7 +11,8 @@ pub(crate) unsafe fn screenshot() -> Option<String> {
         windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(prev);
         return None;
     }
-    let (scr, mem) = (GetDC(null_mut()), CreateCompatibleDC(GetDC(null_mut())));
+    let scr = GetDC(null_mut());
+    let mem = CreateCompatibleDC(scr);
     let bmp = CreateCompatibleBitmap(scr, w, h);
     let old = SelectObject(mem, bmp);
     BitBlt(mem, 0, 0, w, h, scr, x, y, SRCCOPY | 0x4000_0000); // CAPTUREBLT: layered windows (the wallpaper, overlays) too

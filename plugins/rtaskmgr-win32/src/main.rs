@@ -89,6 +89,14 @@ fn main() {
     // Без прав администратора диспетчер не закроет защищённые процессы (Malwarebytes и т.п.): перезапускаемся через
     // задачу планировщика — с правами и без UAC. "--tray" передаём файлом: у задачи нет аргументов.
     let tray_flag = store::dir().join("tray.flag");
+    // already running (maybe hidden in the tray after its window was closed): bring that one back instead of a new copy
+    let tray_start = args.iter().any(|a| a == "--tray");
+    if sys::running() {
+        if !tray_start {
+            sys::ask_running_to_show();
+        }
+        return;
+    }
     if !sys::is_admin() {
         if args.iter().any(|a| a == "--tray") {
             let _ = std::fs::create_dir_all(store::dir());
@@ -98,6 +106,13 @@ fn main() {
             return;
         }
         let _ = std::fs::remove_file(&tray_flag);
+    }
+    if !sys::claim() {
+        // two starts at once: the other one won
+        if !tray_start {
+            sys::ask_running_to_show();
+        }
+        return;
     }
     let ifeo = sys::taskmgr_args(&args); // Some = нас запустили вместо taskmgr.exe
     // Мы подменяем системный диспетчер: если упадём, Ctrl+Shift+Esc не должен остаться без ответа.
@@ -208,6 +223,9 @@ fn main() {
     // горячая клавиша Ctrl+Alt+T
     let hwnd = app.win.handle.hwnd().unwrap();
     unsafe { RegisterHotKey(hwnd, 1, (MOD_CONTROL | MOD_ALT) as u32, b'T' as u32) };
+    // a second start (Ctrl+Shift+Esc again) asks us to show the window; it may come from a non-elevated launcher
+    let show_msg = sys::show_msg();
+    unsafe { ChangeWindowMessageFilterEx(hwnd, show_msg, 1, std::ptr::null_mut()) }; // 1 = MSGFLT_ALLOW
 
     let a = app.clone();
     let _raw = nwg::bind_raw_event_handler(&app.win.handle, 0x10000, move |hwnd, msg, w, l| -> Option<isize> {
@@ -269,6 +287,10 @@ fn main() {
                 Some(a.edit_brush.get())
             },
             WM_HOTKEY if w == 1 => {
+                a.show_window();
+                Some(0)
+            }
+            m if m == show_msg => {
                 a.show_window();
                 Some(0)
             }

@@ -121,6 +121,8 @@ static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
+const WM_SEARCH_HIT: u32 = WM_APP + 7; // global background search batch: wp = Box<(gen, Vec<Row>, bool, String)>
+static SEARCH_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
     Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
@@ -131,7 +133,8 @@ fn sort_rows(rows: &mut [Row], col: usize, asc: bool) {
     let key = |r: &Row| r.name.rsplit('\\').next().unwrap_or("").to_lowercase();
     rows.sort_by(|a, b| {
         let o = match col { 1 => a.time.cmp(&b.time), 2 => type_text(&a.name, a.dir).cmp(&type_text(&b.name, b.dir)), 3 => a.size.cmp(&b.size), _ => key(a).cmp(&key(b)) };
-        (!a.dir).cmp(&!b.dir).then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
+        let dirs = if folders_first() { (!a.dir).cmp(&!b.dir) } else { std::cmp::Ordering::Equal };
+        dirs.then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
     });
     // grouped by date: the groups are contiguous (the stable sort keeps the order above inside each one)
     if group_on() { bucket_refresh(); rows.sort_by_cached_key(|r| bucket(r.time)); }
@@ -148,6 +151,7 @@ thread_local! {
 
 fn group_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date") }
 static THUMBS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // thumbnail view: no headings
+static VIEW_SIG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // view_sig() last applied
 fn group_on() -> bool { !desk() && !THUMBS.load(Relaxed) && group_marker().exists() }
 
 /// Takes "now" and the time zone offset once, so bucket() is plain arithmetic while a folder is sorted and painted.
@@ -454,21 +458,71 @@ unsafe fn bg_menu(h: HWND) {
     if id != 0 { reload(h); }
 }
 
+/// Default folder when opened with no path (or an invalid one): follows the WinRust Explorer setting.
+fn default_start_dir() -> PathBuf {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Downloads};
+    let pick = match winrust_common::style::explorer_start() {
+        1 => sh::known_dir(&FOLDERID_Desktop),
+        2 => sh::known_dir(&FOLDERID_Downloads),
+        3 => Some(PathBuf::from("C:\\")),
+        _ => env::var_os("USERPROFILE").map(PathBuf::from),
+    };
+    pick.filter(|p| p.is_dir())
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from).filter(|p| p.is_dir()))
+        .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
 /// Command line -> (folder to open, file to select there). Understands `/select,"C:\a\b.txt"` (what browsers and other
-/// apps pass for "show in folder"), a plain folder, or a plain file path (its folder, file selected).
+/// apps pass for "show in folder"), Explorer switches (`/e`, `/n`, `/root,...`), a plain folder, or a plain file path.
 fn start_target() -> (PathBuf, Option<String>) {
-    let mut a = env::args().skip(1);
-    let mut p = a.next().unwrap_or_default();
-    if p.to_lowercase().starts_with("/select,") || p.to_lowercase().starts_with("--select") {
-        p = p.get(8..).unwrap_or("").trim_start_matches(',').to_string();
-        if p.is_empty() { p = a.next().unwrap_or_default(); }
+    let args: Vec<String> = env::args().skip(1).collect();
+    parse_start_args(&args, default_start_dir())
+}
+
+fn parse_start_args(args: &[String], fallback: PathBuf) -> (PathBuf, Option<String>) {
+    let mut i = 0;
+    let mut raw = String::new();
+    while i < args.len() {
+        let a = args[i].trim().trim_matches('"');
+        let l = a.to_ascii_lowercase();
+        if l == "/e" || l == "/n" || l == "/separate" || l == "/root" {
+            i += 1;
+            continue;
+        }
+        if l.starts_with("/e,") || l.starts_with("/n,") {
+            let rest = a[3..].trim().trim_matches('"');
+            if !rest.is_empty() { raw = rest.to_string(); break; }
+            i += 1;
+            continue;
+        }
+        if l.starts_with("/root,") {
+            let rest = a[6..].trim().trim_matches('"');
+            if !rest.is_empty() { raw = rest.to_string(); break; }
+            i += 1;
+            continue;
+        }
+        if l.starts_with("/select,") || l.starts_with("--select") {
+            let mut rest = a.get(8..).unwrap_or("").trim_start_matches(',').trim().trim_matches('"').to_string();
+            if rest.is_empty() && i + 1 < args.len() {
+                rest = args[i + 1].trim().trim_matches('"').to_string();
+            }
+            raw = rest;
+            break;
+        }
+        raw = a.to_string();
+        break;
     }
-    let p = PathBuf::from(p.trim_matches('"'));
-    if p.as_os_str().is_empty() { return (PathBuf::from("C:\\"), None); }
-    match (p.is_file(), p.parent()) {
-        (true, Some(d)) => (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())),
-        _ => (p, None),
+    if raw.is_empty() { return (fallback, None); }
+    let p = PathBuf::from(&raw);
+    if p.is_file() {
+        if let Some(d) = p.parent() {
+            return (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        }
     }
+    if p.is_dir() || zipx::split_zip(&p).is_some() {
+        return (p, None);
+    }
+    (fallback, None)
 }
 
 /// Another app asked the shell to show `p` in a folder window (SHOpenFolderAndSelectItems): open its folder here, select it, come to front.
@@ -477,10 +531,7 @@ fn shell_select(h: isize, p: PathBuf) {
     let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
     if !cur_dir().as_os_str().eq_ignore_ascii_case(dir.as_os_str()) { load(h, dir.to_path_buf()); }
     select_row(&name.to_string_lossy());
-    unsafe {
-        if IsIconic(h) != 0 { ShowWindow(h, SW_RESTORE); }
-        SetForegroundWindow(h);
-    }
+    winrust_common::fg::raise(h);
 }
 
 /// Selects and scrolls to the row called `name` in the current folder.
@@ -537,6 +588,42 @@ fn tab_text(tab: HWND, _i: usize, _text: &str, _insert: bool) {
 
 /// The text of a desktop row. Rows from the public desktop carry absolute paths: only the file name is shown, and shortcuts
 /// lose their ".lnk" / ".url" like in Explorer. Other windows show the row as it is.
+fn opt(f: winrust_common::style::Flag) -> bool { winrust_common::style::flag(f) }
+fn folders_first() -> bool { opt(winrust_common::style::Flag::ExpFoldersFirst) }
+fn show_ext() -> bool { opt(winrust_common::style::Flag::ExpExtensions) }
+
+/// The Explorer switches that change how a listing looks: a change reloads open windows.
+fn view_sig() -> u8 {
+    use winrust_common::style::Flag::*;
+    [ExpExtensions, ExpFoldersFirst, ExpSingleClick].iter().enumerate().map(|(i, &f)| (opt(f) as u8) << i).sum()
+}
+
+/// The name column of a folder listing: without the extension when extensions are hidden (folders keep their dots).
+fn list_name(name: &str, dir: bool, show_ext: bool) -> String {
+    if show_ext || dir { return name.to_string(); }
+    let file_at = name.rfind('\\').map_or(0, |i| i + 1);
+    match name[file_at..].rfind('.') {
+        Some(d) if d > 0 => name[..file_at + d].to_string(), // ".gitignore" stays whole
+        _ => name.to_string(),
+    }
+}
+
+/// The file name a rename box's text means: with extensions hidden the box shows the name without it, so the old one goes back on
+/// (unless the user typed a new extension themselves... which a hidden-extension box cannot tell apart, so like Explorer: always).
+fn renamed(old: &str, typed: &str, dir: bool, show_ext: bool) -> String {
+    if show_ext || dir { return typed.to_string(); }
+    let shown = list_name(old, false, false);
+    if shown.len() == old.len() { return typed.to_string(); } // no extension to keep
+    format!("{typed}{}", &old[shown.len()..])
+}
+
+/// One click opens (hover selects, the name underlines) or the usual double click.
+unsafe fn apply_click_mode(list: HWND) {
+    let one = (LVS_EX_ONECLICKACTIVATE | LVS_EX_UNDERLINEHOT | LVS_EX_TRACKSELECT) as usize;
+    let on = opt(winrust_common::style::Flag::ExpSingleClick);
+    put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, one, if on { one as isize } else { 0 });
+}
+
 fn shown_name(name: &str, desktop: bool) -> String {
     if !desktop { return name.to_string(); }
     let file = std::path::Path::new(name).file_name().map_or_else(|| name.to_string(), |n| n.to_string_lossy().into_owned());
@@ -580,6 +667,7 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
     let Some(rows) = rows_of(&dir) else { return };
+    SEARCH_GEN.fetch_add(1, Relaxed); // navigating cancels any in-flight global search
     if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
     let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
@@ -609,38 +697,137 @@ fn ask(d: char, q: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Fills the list with search hits from every drive's service. Rows hold absolute paths, so joining them
-/// onto the current dir still yields the right file. Blocks the UI for the duration of the query (fast).
+/// Fixed drives on this machine (`C:\`, `D:\`, ...), for global search when the rs-search service is not running.
+fn fixed_drives() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u32).filter(|&i| (mask & (1 << i)) != 0).filter_map(|i| {
+        let p = format!("{}:\\", (b'A' + i as u8) as char);
+        (unsafe { GetDriveTypeW(w(&p).as_ptr()) } == 3 /* DRIVE_FIXED */).then(|| PathBuf::from(p))
+    }).collect()
+}
+
+fn skip_global_dir(name: &str) -> bool {
+    matches!(name, "$recycle.bin" | "system volume information" | "winsxs" | "servicing" | "installer" | "node_modules" | ".git" | "windowsapps")
+}
+
+/// Fills the list with global search hits across all drives. Uses the rust-search MFT service when available,
+/// otherwise streams a non-blocking global walk (current folder -> user profile -> all fixed drives) from a worker thread.
 /// Never call with ST borrowed.
 fn search(h: HWND, q: &str) {
+    let gen_ = SEARCH_GEN.fetch_add(1, Relaxed) + 1;
+    // The list clears now; everything that touches pipes or the disk runs off the UI thread (a sleeping disk or a
+    // network drive used to freeze the window here), and the hits come back as WM_SEARCH_HIT batches.
+    ui::set_search(Some(q.to_string()));
+    unsafe { SetWindowTextW(h, w(&format!("searching: {q}…")).as_ptr()) };
+    let list = ST.with_borrow_mut(|st| { st.rows.clear(); st.list });
+    reset_thumbs();
+    put(list, LVM_DELETEALLITEMS, 0, 0);
+    put(list, LVM_SETITEMCOUNT, 0, 0);
+    let cur = cur_dir();
+    let q_owned = q.to_string();
+    let hw = h as isize;
+    std::thread::spawn(move || {
+        if !indexed_search(hw, gen_, &q_owned) {
+            global_search_worker(hw, gen_, cur, q_owned); // no rs-search service: walk every fixed drive
+        }
+    });
+}
+
+/// Asks the rust-search services of all drives and sends their hits as one batch. False when no drive has a service.
+fn indexed_search(hw: isize, gen_: u32, q: &str) -> bool {
     let mut rows = vec![];
     let mut more = String::new();
-    let mut indexed = false; // some drive had a rust-search service
+    let mut indexed = false;
     for d in 'A'..='Z' {
         let Some(reply) = ask(d, q) else { continue };
         indexed = true;
         for line in reply.lines() {
+            if SEARCH_GEN.load(Relaxed) != gen_ { return true; } // a newer search or a navigation took over
             if line.starts_with("... ") { more = format!(", {}", line.trim_start_matches("... ")); continue; }
             let m = fs::metadata(line).ok();
             rows.push(row(line.to_string(), m.as_ref()));
         }
     }
-    if !indexed {
-        // no rust-search installed: look through the current folder and below instead
-        let (local, cut, flipped) = local_search(&cur_dir(), q);
-        if flipped { more = format!(" for \u{201C}{}\u{201D}", flip_layout(q)); } // typed in the wrong layout: shown what was meant
-        rows = local;
-        if cut { more += ", stopped early: narrow the search"; }
+    if indexed {
+        let n = rows.len();
+        let title = if n == 0 { format!("search: {q} - nothing") } else { format!("search: {q} - {n} hits{more}") };
+        let ptr = Box::into_raw(Box::new((gen_, rows, true, title)));
+        if unsafe { PostMessageW(hw as HWND, WM_SEARCH_HIT, ptr as WPARAM, 0) } == 0 {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
     }
-    let n = rows.len();
-    let where_ = if indexed { "" } else { " in this folder" };
-    let title = if n == 0 { format!("search: {q} - nothing{where_}") } else { format!("search: {q} - {n} hits{where_}{more}") };
-    ui::set_search(Some(q.to_string()));
-    unsafe { SetWindowTextW(h, w(&title).as_ptr()) };
-    let list = ST.with_borrow_mut(|st| { st.rows = rows; st.list });
-    reset_thumbs();
-    put(list, LVM_DELETEALLITEMS, 0, 0);
-    put(list, LVM_SETITEMCOUNT, n, 0);
+    indexed
+}
+
+fn global_search_worker(hw: isize, gen_: u32, cur: PathBuf, q: String) {
+    const MAX_HITS: usize = 2000;
+    const MAX_MS: u128 = 12_000;
+    let ql = q.to_lowercase();
+    let alt = flip_layout(&ql);
+    let t0 = std::time::Instant::now();
+    let mut last_flush = std::time::Instant::now();
+    // Search order: current folder, then user profile (Desktop/Downloads/Documents), then every fixed drive.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push_root = |p: PathBuf| {
+        if p.is_dir() && !roots.iter().any(|r| r.as_os_str().eq_ignore_ascii_case(p.as_os_str())) {
+            roots.push(p);
+        }
+    };
+    if !cur.as_os_str().is_empty() { push_root(cur); }
+    if let Some(u) = env::var_os("USERPROFILE").map(PathBuf::from) { push_root(u); }
+    for d in fixed_drives() { push_root(d); }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut batch: Vec<Row> = Vec::new();
+    let mut other: Vec<Row> = Vec::new();
+    let mut total = 0usize;
+    let mut cut = false;
+
+    let send_batch = |b: Vec<Row>, done: bool, title: String| {
+        let ptr = Box::into_raw(Box::new((gen_, b, done, title)));
+        if unsafe { PostMessageW(hw as HWND, WM_SEARCH_HIT, ptr as WPARAM, 0) } == 0 {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
+    };
+
+    'outer: for root in roots {
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(d) = queue.pop_front() {
+            if SEARCH_GEN.load(Relaxed) != gen_ { return; }
+            let key = d.to_string_lossy().to_lowercase();
+            if !seen.insert(key) { continue; }
+            for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                if SEARCH_GEN.load(Relaxed) != gen_ { return; }
+                if total >= MAX_HITS || t0.elapsed().as_millis() > MAX_MS { cut = true; break 'outer; }
+                let Ok(ft) = e.file_type() else { continue };
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                if ft.is_dir() && !ft.is_symlink() && !skip_global_dir(&name) {
+                    queue.push_back(e.path());
+                }
+                if name.contains(&ql) {
+                    batch.push(row(e.path().to_string_lossy().into_owned(), e.metadata().ok().as_ref()));
+                    total += 1;
+                    if batch.len() >= 50 || last_flush.elapsed().as_millis() >= 120 {
+                        let b = std::mem::take(&mut batch);
+                        send_batch(b, false, format!("searching: {q} — {total} hits…"));
+                        last_flush = std::time::Instant::now();
+                    }
+                } else if alt != ql && total == 0 && other.len() < MAX_HITS && name.contains(&alt) {
+                    other.push(row(e.path().to_string_lossy().into_owned(), e.metadata().ok().as_ref()));
+                }
+            }
+        }
+    }
+    if SEARCH_GEN.load(Relaxed) != gen_ { return; }
+    let (final_batch, n, extra) = if total == 0 && !other.is_empty() {
+        let n = other.len();
+        (other, n, format!(" for \u{201C}{alt}\u{201D}"))
+    } else {
+        (batch, total, if cut { ", stopped early: narrow the search".into() } else { String::new() })
+    };
+    let title = if n == 0 { format!("search: {q} - nothing") } else { format!("search: {q} - {n} hits{extra}") };
+    send_batch(final_batch, true, title);
 }
 
 /// The same keys typed in the other layout (QWERTY <-> ЙЦУКЕН): "сфкпщ" -> "cargo", "ljrevtyns" -> "документы".
@@ -655,6 +842,7 @@ fn flip_layout(q: &str) -> String {
 /// in the other keyboard layout; those hits are used only when `q` itself found nothing.
 /// Returns (rows, stopped early, rows are for the other layout).
 /// shortcut: blocks the UI while it walks (up to LOCAL_MS); move to a thread if deeper searches are wanted.
+#[allow(dead_code)]
 fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
     const LOCAL_MAX: usize = 500;
     const LOCAL_MS: u128 = 1500;
@@ -889,8 +1077,11 @@ mod sh {
                 let padded = pad(bmp.0);
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp.0 as _);
                 if padded.is_null() { continue; }
-                let b = Box::new((era, row, padded as isize));
-                let _ = PostMessageW(Some(HWND(main as *mut c_void)), super::WM_THUMB, WPARAM(Box::into_raw(b) as usize), LPARAM(0));
+                let ptr = Box::into_raw(Box::new((era, row, padded as isize)));
+                if PostMessageW(Some(HWND(main as *mut c_void)), super::WM_THUMB, WPARAM(ptr as usize), LPARAM(0)).is_err() {
+                    drop(Box::from_raw(ptr));
+                    windows_sys::Win32::Graphics::Gdi::DeleteObject(padded as _);
+                }
             }
         });
         tx
@@ -1479,9 +1670,19 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
 unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if m == winrust_common::style::msg() {
-            // the topbar switched the WinRust style: take it now (the desktop's list keeps its see-through colours)
+            // the topbar switched the WinRust style or Explorer settings: take them now
             winrust_common::style::reload();
-            if desk() { InvalidateRect(h, ptr::null(), 1); } else { ui::restyle(h); }
+            let hid = winrust_common::style::explorer_hidden();
+            let changed_hid = SHOW_HIDDEN.swap(hid, Relaxed) != hid;
+            if desk() {
+                InvalidateRect(h, ptr::null(), 1);
+            } else {
+                ui::restyle(h);
+                let sig = view_sig();
+                let changed_view = VIEW_SIG.swap(sig, Relaxed) != sig;
+                if changed_view { apply_click_mode(ST.with_borrow(|st| st.list)); }
+                if changed_hid || changed_view { reload(h); }
+            }
             return 0;
         }
         match m {
@@ -1501,6 +1702,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let view = if desk() { LVS_ICON } else { LVS_REPORT };
                 let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
                 put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
+                if !desk() { apply_click_mode(list); }
+                VIEW_SIG.store(view_sig(), Relaxed);
                 let mut fi: SHFILEINFOW = std::mem::zeroed();
                 let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
                 put(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, il as isize);
@@ -1537,8 +1740,19 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 // live wallpaper: the list is see-through (colour key), so over empty desktop OLE finds the wallpaper window under it,
                 // and walks up from there to the desktop window: it must accept the drop too
                 if desk() { let _ = sh::register_drop(h as _, h as isize); }
+                SHOW_HIDDEN.store(winrust_common::style::explorer_hidden(), Relaxed);
+                if !desk() && opt(winrust_common::style::Flag::ExpThumbs) {
+                    let list = ST.with_borrow_mut(|st| { st.list = list; st.thumbs = true; list });
+                    THUMBS.store(true, Relaxed);
+                    ui::row_height(list, false);
+                    put(list, LVM_SETVIEW, LV_VIEW_ICON as usize, 0);
+                }
                 let (start, pick) = if desk() { (sh::desktop_dirs().into_iter().next().unwrap_or_default(), None) } else { start_target() };
                 load(h, start);
+                if !desk() && cur_dir().as_os_str().is_empty() {
+                    load(h, default_start_dir());
+                    if cur_dir().as_os_str().is_empty() { load(h, PathBuf::from("C:\\")); }
+                }
                 if let Some(name) = pick { select_row(&name); }
                 if desk() {
                     use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
@@ -1645,7 +1859,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
+                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 if desk() => shown_name(&r.name, true), 0 => list_name(&r.name, r.dir, show_ext()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
@@ -1763,7 +1977,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let new = wstr(it.pszText);
                             // reject separators so a rename can never move the item
                             if !new.is_empty() && !new.contains(['\\', '/', ':']) {
-                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) { let _ = fs::rename(st.dir.join(&r.name), st.dir.join(&new)); });
+                                let ext = show_ext() || desk();
+                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) { let _ = fs::rename(st.dir.join(&r.name), st.dir.join(renamed(&r.name, &new, r.dir, ext))); });
                                 PostMessageW(h, WM_APP, 0, 0); // reload after the edit control is gone
                             }
                         }
@@ -1802,16 +2017,38 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp as _);
                 0
             }
+            WM_SEARCH_HIT => {
+                let (gen_, mut batch, _done, title) = *Box::from_raw(wp as *mut (u32, Vec<Row>, bool, String));
+                if gen_ == SEARCH_GEN.load(Relaxed) {
+                    SetWindowTextW(h, w(&title).as_ptr());
+                    let (list, n) = ST.with_borrow_mut(|st| {
+                        st.rows.append(&mut batch);
+                        (st.list, st.rows.len())
+                    });
+                    put(list, LVM_SETITEMCOUNT, n, LVSICF_NOINVALIDATEALL as isize);
+                    InvalidateRect(list, ptr::null(), 0);
+                    InvalidateRect(h, ptr::null(), 0);
+                }
+                0
+            }
             WM_GO => {
                 let (edit, list) = ST.with_borrow(|st| (st.edit, st.list));
                 if wp == 13 {
                     let mut buf = vec![0u16; GetWindowTextLengthW(edit) as usize + 1];
                     let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32) as usize;
-                    let p = PathBuf::from(String::from_utf16_lossy(&buf[..n]).trim().trim_matches('"'));
                     let text = String::from_utf16_lossy(&buf[..n]);
-                    if let Some(q) = text.trim().strip_prefix('?') {
+                    let trimmed = text.trim();
+                    let p = PathBuf::from(trimmed.trim_matches('"'));
+                    if let Some(q) = trimmed.strip_prefix('?') {
                         if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); return 0; } // keep the query in the bar
-                    } else if p.is_dir() || zipx::split_zip(&p).is_some() { load(h, p); } // also a path inside a .zip
+                    } else if p.is_dir() || zipx::split_zip(&p).is_some() {
+                        load(h, p);
+                    } else if !trimmed.is_empty() && !trimmed.contains('\\') && !trimmed.contains(':') {
+                        // plain text typed in the bar: treat it as a global search instead of reverting
+                        search(h, trimmed);
+                        SetFocus(list);
+                        return 0;
+                    }
                 }
                 SetWindowTextW(edit, w(&cur_dir().to_string_lossy()).as_ptr()); // also undoes a bad path / Esc
                 SetFocus(list);
@@ -1979,6 +2216,21 @@ mod tests {
     }
 
     #[test]
+    fn hidden_extensions() {
+        assert_eq!(list_name("Notes.txt", false, false), "Notes");
+        assert_eq!(list_name("a.tar.gz", false, false), "a.tar");
+        assert_eq!(list_name(".gitignore", false, false), ".gitignore");
+        assert_eq!(list_name("my.folder", true, false), "my.folder");
+        assert_eq!(list_name(r"C:\x.y\README", false, false), r"C:\x.y\README");
+        assert_eq!(list_name(r"C:\x\a.rs", false, false), r"C:\x\a");
+        assert_eq!(list_name("Notes.txt", false, true), "Notes.txt");
+        assert_eq!(renamed("Notes.txt", "Todo", false, false), "Todo.txt");
+        assert_eq!(renamed("Makefile", "Build", false, false), "Build");
+        assert_eq!(renamed("Notes.txt", "Todo.md", false, true), "Todo.md");
+        assert_eq!(renamed("dir.v2", "dir.v3", true, false), "dir.v3");
+    }
+
+    #[test]
     fn folders_first_then_by_the_chosen_column() {
         let mut v = vec![r("b.txt", false, 5, 1), r("A", true, 0, 2), r("a.txt", false, 9, 3)];
         sort_rows(&mut v, 0, true);
@@ -2029,6 +2281,16 @@ mod tests {
         assert_eq!(date_text(0), "");
         let t = date_text(132_000_000_000_000_000); // some day in 2019, local time zone
         assert!(t.len() == 16 && t.starts_with("20"), "{t}");
+    }
+
+    #[test]
+    fn start_args_skip_flags_and_never_open_nowhere() {
+        let fb = PathBuf::from("C:\\");
+        assert_eq!(super::parse_start_args(&[], fb.clone()), (fb.clone(), None));
+        assert_eq!(super::parse_start_args(&["/e".into()], fb.clone()), (fb.clone(), None));
+        assert_eq!(super::parse_start_args(&["/n".into(), "Z:\\definitely_nonexistent_dir_12345".into()], fb.clone()), (fb.clone(), None));
+        let tmp = std::env::temp_dir();
+        assert_eq!(super::parse_start_args(&["/e".into(), tmp.to_string_lossy().into_owned()], fb.clone()), (tmp, None));
     }
 }
 

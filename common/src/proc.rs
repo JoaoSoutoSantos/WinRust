@@ -3,15 +3,10 @@ use std::{ffi::c_void, ptr::null_mut};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
     System::{
-        Diagnostics::{
-            Debug::ReadProcessMemory,
-            ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
-        },
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
         Threading::{OpenProcess, TerminateProcess},
     },
 };
-
-const _: () = assert!(size_of::<usize>() == 8, "the PEB offsets below are x64"); // shortcut: x64 only, add the x86 offsets if a 32-bit build appears
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -44,34 +39,38 @@ pub fn pids(name: &str) -> Vec<u32> {
     list().into_iter().filter(|(_, n)| n.eq_ignore_ascii_case(name)).map(|p| p.0).collect()
 }
 
-/// The command line of a process of the same user, read from its PEB. None when it cannot be opened.
+/// The command line of a process via NtQueryInformationProcess(ProcessCommandLineInformation, 60).
+/// Uses PROCESS_QUERY_LIMITED_INFORMATION (0x1000) and avoids hardcoded PEB offsets.
 pub fn cmdline(pid: u32) -> Option<String> {
+    #[repr(C)]
+    struct UnicodeString {
+        len: u16,
+        max: u16,
+        buf: *const u16,
+    }
+    const PROCESS_COMMAND_LINE_INFO: u32 = 60;
     unsafe {
-        let h = OpenProcess(0x0410, 0, pid); // QUERY_INFORMATION | VM_READ
+        let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
         if h.is_null() {
             return None;
         }
-        let read = |addr: usize, buf: *mut c_void, n: usize| ReadProcessMemory(h, addr as *const c_void, buf, n, null_mut()) != 0;
         let r = (|| {
-            let mut pbi = [0usize; 6]; // PROCESS_BASIC_INFORMATION: [1] = PebBaseAddress
-            if NtQueryInformationProcess(h, 0, pbi.as_mut_ptr().cast(), 48, null_mut()) != 0 {
+            let mut need = 0u32;
+            let _ = NtQueryInformationProcess(h, PROCESS_COMMAND_LINE_INFO, null_mut(), 0, &mut need);
+            if (need as usize) < size_of::<UnicodeString>() {
                 return None;
             }
-            let mut params = 0usize; // PEB.ProcessParameters
-            if !read(pbi[1] + 0x20, (&mut params as *mut usize).cast(), 8) {
+            let words = (need as usize).div_ceil(size_of::<usize>());
+            let mut buf = vec![0usize; words];
+            if NtQueryInformationProcess(h, PROCESS_COMMAND_LINE_INFO, buf.as_mut_ptr().cast(), (words * size_of::<usize>()) as u32, &mut need) != 0 {
                 return None;
             }
-            let mut us = [0u8; 16]; // RTL_USER_PROCESS_PARAMETERS.CommandLine, a UNICODE_STRING: len u16, max u16, pad, buffer ptr
-            if !read(params + 0x70, us.as_mut_ptr().cast(), 16) {
-                return None;
+            let us = &*(buf.as_ptr() as *const UnicodeString);
+            if us.buf.is_null() || us.len == 0 {
+                return Some(String::new());
             }
-            let len = u16::from_le_bytes([us[0], us[1]]) as usize;
-            let buf = usize::from_le_bytes(us[8..16].try_into().ok()?);
-            let mut w = vec![0u16; len / 2];
-            if !read(buf, w.as_mut_ptr().cast(), len) {
-                return None;
-            }
-            Some(String::from_utf16_lossy(&w))
+            let slice = std::slice::from_raw_parts(us.buf, (us.len / 2) as usize);
+            Some(String::from_utf16_lossy(slice))
         })();
         CloseHandle(h);
         r

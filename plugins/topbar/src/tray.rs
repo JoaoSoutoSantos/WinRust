@@ -26,20 +26,42 @@ pub(crate) fn hide_onedrive() -> bool {
     std::env::current_exe().ok().and_then(|e| std::fs::read_to_string(e.with_file_name("topbar.cfg")).ok()).is_none_or(|c| !c.contains("hide_onedrive=0"))
 }
 
-/// WM_COPYDATA (dwData 1) from Shell_NotifyIcon: u32 magic, u32 NIM_*, then the platform-neutral NOTIFYICONDATA
-/// (32-bit handles): hWnd@12 uID@16 uFlags@20 callback@24 hIcon@28 dwState@288 mask@292 version@808 guid@944.
+/// Matches an existing tray icon entry following Shell_NotifyIcon rules:
+/// when both have a non-zero GUID, match by GUID; otherwise match by (hwnd, uid) so NIM_SETVERSION / NIM_MODIFY
+/// calls that omit NIF_GUID still update the registered icon.
+fn match_tray_pos(t: &[TIcon], h: HWND, uid: u32, guid: [u8; 16], has_guid: bool) -> Option<usize> {
+    t.iter().position(|x| {
+        if has_guid && x.guid != [0; 16] {
+            x.guid == guid
+        } else {
+            x.hwnd == h && x.uid == uid
+        }
+    })
+}
+
+/// WM_COPYDATA (dwData 1) from Shell_NotifyIcon: u32 magic (0x34753423), u32 NIM_*, then the platform-neutral NOTIFYICONDATA
+/// (32-bit handles): hWnd@12 uID@16 uFlags@20 callback@24 hIcon@28 szTip@32 dwState@288 mask@292 version@808 guid@944.
+pub(crate) const SHELL_TRAY_MAGIC: u32 = 0x3475_3423;
+
 pub(crate) unsafe fn tray_msg(d: &[u8]) {
+    if d.len() < 32 {
+        return;
+    }
     let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    if u(0) != SHELL_TRAY_MAGIC {
+        return;
+    }
     let (op, flags, uid) = (u(4), u(20), u(16));
     let h = u(12) as i32 as isize as HWND;
-    let guid: [u8; 16] = if flags & 0x20 != 0 { d[944..960].try_into().unwrap() } else { [0; 16] };
+    let has_guid = flags & 0x20 != 0 && d.len() >= 960;
+    let guid: [u8; 16] = if has_guid { d[944..960].try_into().unwrap() } else { [0; 16] };
     TAPPS.with_borrow_mut(|t| {
-        let pos = t.iter().position(|x| x.hwnd == h && x.uid == uid && x.guid == guid);
+        let pos = match_tray_pos(t, h, uid, guid, has_guid);
         match (op, pos) {
             (2, Some(i)) => {
                 DestroyIcon(t.remove(i).icon);
             }
-            (4, Some(i)) => t[i].ver = u(808),
+            (4, Some(i)) if d.len() >= 812 => t[i].ver = u(808),
             (0 | 1, _) => {
                 let i = match pos {
                     Some(i) => i,
@@ -50,11 +72,16 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                         if n == "explorer.exe" || n == "topbar.exe" || (n == "onedrive.exe" && hide_onedrive()) {
                             return; // the system's own icons are drawn by the bar itself
                         }
-                        t.push(TIcon { hwnd: h, uid, guid, icon: null_mut(), cb: 0, ver: 0, hidden: false, tip: String::new(), key: n.to_string() });
+                        // Never collide protected/unreadable processes under empty key ""
+                        let key = if n.is_empty() { format!("hwnd:{:x}", h as usize) } else { n.to_string() };
+                        t.push(TIcon { hwnd: h, uid, guid, icon: null_mut(), cb: 0, ver: 0, hidden: false, tip: String::new(), key });
                         t.len() - 1
                     }
                 };
                 let x = &mut t[i];
+                if has_guid && x.guid == [0; 16] {
+                    x.guid = guid;
+                }
                 if flags & 1 != 0 {
                     x.cb = u(24);
                 }
@@ -67,11 +94,12 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                         x.icon = ic;
                     }
                 }
-                if flags & 4 != 0 {
-                    let w: Vec<u16> = d[32..288].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+                if flags & 4 != 0 && d.len() > 32 {
+                    let end = d.len().min(288);
+                    let w: Vec<u16> = d[32..end].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
                     x.tip = String::from_utf16_lossy(&w);
                 }
-                if flags & 8 != 0 && u(292) & 1 != 0 {
+                if flags & 8 != 0 && d.len() >= 296 && u(292) & 1 != 0 {
                     x.hidden = u(288) & 1 != 0; // NIS_HIDDEN
                 }
             }
@@ -82,8 +110,11 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
 
 pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_COPYDATA {
+        if lp == 0 {
+            return 0;
+        }
         let c = &*(lp as *const Cds);
-        if c.dw == 1 && c.cb >= 964 {
+        if c.dw == 1 && c.cb >= 160 && !c.p.is_null() {
             tray_msg(std::slice::from_raw_parts(c.p, c.cb as usize));
             return 1;
         }
@@ -96,30 +127,41 @@ pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM,
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
-/// Posts the same messages explorer would for a click on the icon; the app shows its own window or menu.
-pub(crate) unsafe fn tray_click(t: (HWND, u32, u32, u32), left: bool) {
+/// Computes the exact mouse/semantic events to post to a tray icon owner for single/double left click or right click.
+pub(crate) fn tray_click_events(ver: u32, left: bool, dbl: bool) -> &'static [u32] {
+    if left && dbl {
+        &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]
+    } else if left {
+        if ver >= 4 { &[0x400 /* NIN_SELECT */] } else { &[WM_LBUTTONDOWN, WM_LBUTTONUP] }
+    } else if ver >= 4 {
+        &[WM_CONTEXTMENU]
+    } else {
+        &[WM_RBUTTONDOWN, WM_RBUTTONUP]
+    }
+}
+
+/// Posts the same messages explorer would for a click (or double-click) on the icon; returns false if PostMessageW failed (e.g. UIPI).
+pub(crate) unsafe fn tray_click(t: (HWND, u32, u32, u32), left: bool, dbl: bool) -> bool {
     let (hwnd, uid, cb, ver) = t;
     if cb == 0 {
-        return;
+        return false;
     }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    AllowSetForegroundWindow(pid); // so the app can bring its popup menu to the front
+    // ASFW_ANY (u32::MAX): apps with a hidden tray message-only window often open their popup menu from another thread/process.
+    AllowSetForegroundWindow(u32::MAX);
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
-    let post = |ev: u32| {
-        if ver >= 4 {
-            PostMessageW(hwnd, cb, ((pt.x as u32 & 0xffff) | (pt.y as u32) << 16) as usize, (ev | (uid & 0xffff) << 16) as isize);
+    let mut ok = true;
+    for &ev in tray_click_events(ver, left, dbl) {
+        let r = if ver >= 4 {
+            PostMessageW(hwnd, cb, ((pt.x as u32 & 0xffff) | (pt.y as u32) << 16) as usize, (ev | (uid & 0xffff) << 16) as isize)
         } else {
-            PostMessageW(hwnd, cb, uid as usize, ev as isize);
+            PostMessageW(hwnd, cb, uid as usize, ev as isize)
+        };
+        if r == 0 {
+            ok = false;
         }
-    };
-    match (left, ver >= 4) {
-        (true, true) => post(0x400), // NIN_SELECT
-        (true, false) => [WM_LBUTTONDOWN, WM_LBUTTONUP].into_iter().for_each(post),
-        (false, true) => post(WM_CONTEXTMENU),
-        (false, false) => [WM_RBUTTONDOWN, WM_RBUTTONUP].into_iter().for_each(post),
     }
+    ok
 }
 
 /// Indices into TAPPS of the icons kept on the bar; the rest live in the chevron flyout.
@@ -149,3 +191,35 @@ pub(crate) fn toggle_shown(key: &str) {
 }
 
 // ---------- tray overflow flyout (the chevron): every icon, click / right click work as in the real tray ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(hwnd: usize, uid: u32, guid: [u8; 16]) -> TIcon {
+        TIcon { hwnd: hwnd as HWND, uid, guid, icon: null_mut(), cb: 0x400, ver: 0, hidden: false, tip: String::new(), key: "app.exe".into() }
+    }
+
+    #[test]
+    fn tray_match_handles_guid_and_setversion_without_guid() {
+        let g = [7u8; 16];
+        let icons = vec![mk(0x100, 1, g), mk(0x200, 2, [0; 16])];
+        // Match by GUID even if hwnd/uid differs
+        assert_eq!(match_tray_pos(&icons, 0x999 as HWND, 9, g, true), Some(0));
+        // NIM_SETVERSION / NIM_MODIFY omitting NIF_GUID still finds the icon by (hwnd, uid)
+        assert_eq!(match_tray_pos(&icons, 0x100 as HWND, 1, [0; 16], false), Some(0));
+        // Plain legacy icon without GUID matches by (hwnd, uid)
+        assert_eq!(match_tray_pos(&icons, 0x200 as HWND, 2, [0; 16], false), Some(1));
+        assert_eq!(match_tray_pos(&icons, 0x300 as HWND, 1, [0; 16], false), None);
+    }
+
+    #[test]
+    fn tray_click_events_cover_double_click_and_versions() {
+        assert_eq!(tray_click_events(0, true, false), &[WM_LBUTTONDOWN, WM_LBUTTONUP]);
+        assert_eq!(tray_click_events(0, true, true), &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]);
+        assert_eq!(tray_click_events(4, true, false), &[0x400]);
+        assert_eq!(tray_click_events(4, true, true), &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]);
+        assert_eq!(tray_click_events(0, false, false), &[WM_RBUTTONDOWN, WM_RBUTTONUP]);
+        assert_eq!(tray_click_events(4, false, false), &[WM_CONTEXTMENU]);
+    }
+}

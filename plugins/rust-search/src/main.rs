@@ -289,7 +289,8 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
         (g.jid, g.usn)
     };
     loop {
-        let rd = READ_USN_JOURNAL_DATA_V0 { StartUsn: usn, ReasonMask: mask, ReturnOnlyOnClose: 0, Timeout: 1, BytesToWaitFor: 1, UsnJournalID: jid };
+        // Timeout 0 + BytesToWaitFor 1: kernel blocks at 0% CPU until at least one matching USN record arrives.
+        let rd = READ_USN_JOURNAL_DATA_V0 { StartUsn: usn, ReasonMask: mask, ReturnOnlyOnClose: 0, Timeout: 0, BytesToWaitFor: 1, UsnJournalID: jid };
         let mut n = 0u32;
         let ok = unsafe {
             DeviceIoControl(h, FSCTL_READ_USN_JOURNAL, &rd as *const _ as _, size_of::<READ_USN_JOURNAL_DATA_V0>() as u32, buf.as_mut_ptr() as _, buf.len() as u32, &mut n, ptr::null_mut())
@@ -300,9 +301,12 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
             return;
         }
         let b = &buf[..n as usize];
+        if b.len() < 8 {
+            continue;
+        }
         usn = i64::from_le_bytes(b[..8].try_into().unwrap());
-        let mut g = sh.lock().unwrap();
         if b.len() > 8 {
+            let mut g = sh.lock().unwrap();
             records(b, |frn, parent, reason, name| {
                 if reason & USN_REASON_FILE_DELETE != 0 {
                     g.idx.remove(frn);
@@ -310,9 +314,9 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
                     g.idx.insert(frn, parent, &name);
                 }
             });
+            g.usn = usn;
             g.dirty = true;
         }
-        g.usn = usn;
     }
 }
 
@@ -358,19 +362,33 @@ fn load_saved(drive: char, j: &USN_JOURNAL_DATA_V0) -> Option<(Index, i64)> {
 /// Writes the snapshot (temp file + rename, so a crash never leaves a torn file) if anything changed.
 fn save(drive: char, sh: &Mutex<Shared>) {
     let Some(path) = index_path(drive) else { return };
-    let mut g = sh.lock().unwrap();
-    if !g.dirty {
-        return;
-    }
+    // Serialize in RAM under the lock, then release the lock before disk I/O so search queries never stall.
+    let (buf, saved_usn) = {
+        let g = sh.lock().unwrap();
+        if !g.dirty {
+            return;
+        }
+        let mut buf = Vec::new();
+        if let Err(e) = g.idx.write_to(&mut buf, g.jid, g.usn) {
+            eprintln!("cannot serialize index for {drive}: {e}");
+            return;
+        }
+        (buf, g.usn)
+    };
     let tmp = path.with_extension("tmp");
     let r = fs::create_dir_all(path.parent().unwrap()).and_then(|_| {
         let mut w = BufWriter::new(File::create(&tmp)?);
-        g.idx.write_to(&mut w, g.jid, g.usn)?;
+        w.write_all(&buf)?;
         w.flush()?;
         fs::rename(&tmp, &path)
     });
     match r {
-        Ok(()) => g.dirty = false,
+        Ok(()) => {
+            let mut g = sh.lock().unwrap();
+            if g.usn == saved_usn {
+                g.dirty = false;
+            }
+        }
         Err(e) => eprintln!("cannot save index to {}: {e}", path.display()),
     }
 }
