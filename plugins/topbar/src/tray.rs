@@ -26,6 +26,12 @@ pub(crate) fn hide_onedrive() -> bool {
     std::env::current_exe().ok().and_then(|e| std::fs::read_to_string(e.with_file_name("topbar.cfg")).ok()).is_none_or(|c| !c.contains("hide_onedrive=0"))
 }
 
+/// Explorer's volume, network and power icons ({7820AE73/74/75-23E3-4229-82C1-E41CB67D5B9C}): the bar draws those itself.
+/// Its other icons (printer queue, Safely Remove Hardware, microphone in use) stay (#127).
+fn own_icon(guid: &[u8; 16]) -> bool {
+    matches!(guid[0], 0x73..=0x75) && guid[1..] == [0xAE, 0x20, 0x78, 0xE3, 0x23, 0x29, 0x42, 0x82, 0xC1, 0xE4, 0x1C, 0xB6, 0x7D, 0x5B, 0x9C]
+}
+
 /// Matches an existing tray icon entry following Shell_NotifyIcon rules:
 /// when both have a non-zero GUID, match by GUID; otherwise match by (hwnd, uid) so NIM_SETVERSION / NIM_MODIFY
 /// calls that omit NIF_GUID still update the registered icon.
@@ -69,7 +75,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                     None => {
                         let exe = exe_of(h);
                         let n = exe.rsplit('\\').next().unwrap_or("");
-                        if n == "explorer.exe" || n == "topbar.exe" || (n == "onedrive.exe" && hide_onedrive()) {
+                        if (n == "explorer.exe" && own_icon(&guid)) || n == "topbar.exe" || (n == "onedrive.exe" && hide_onedrive()) {
                             return; // the system's own icons are drawn by the bar itself
                         }
                         // Never collide protected/unreadable processes under empty key ""
@@ -129,14 +135,14 @@ pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM,
 
 /// Computes the exact mouse/semantic events to post to a tray icon owner for single/double left click or right click.
 pub(crate) fn tray_click_events(ver: u32, left: bool, dbl: bool) -> &'static [u32] {
-    if left && dbl {
-        &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]
-    } else if left {
-        if ver >= 4 { &[0x400 /* NIN_SELECT */] } else { &[WM_LBUTTONDOWN, WM_LBUTTONUP] }
-    } else if ver >= 4 {
-        &[WM_CONTEXTMENU]
-    } else {
-        &[WM_RBUTTONDOWN, WM_RBUTTONUP]
+    // what Explorer sends: the raw button messages always, plus NIN_SELECT / WM_CONTEXTMENU for version 4. Many apps open
+    // only on the button-up or the double click (Steam), so NIN_SELECT alone left them dead (#115).
+    match (left, dbl, ver >= 4) {
+        (true, true, _) => &[WM_LBUTTONDBLCLK, WM_LBUTTONUP],
+        (true, false, true) => &[WM_LBUTTONDOWN, WM_LBUTTONUP, 0x400 /* NIN_SELECT */],
+        (true, false, false) => &[WM_LBUTTONDOWN, WM_LBUTTONUP],
+        (false, _, true) => &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU],
+        (false, _, false) => &[WM_RBUTTONDOWN, WM_RBUTTONUP],
     }
 }
 
@@ -217,9 +223,9 @@ mod tests {
     fn tray_click_events_cover_double_click_and_versions() {
         assert_eq!(tray_click_events(0, true, false), &[WM_LBUTTONDOWN, WM_LBUTTONUP]);
         assert_eq!(tray_click_events(0, true, true), &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]);
-        assert_eq!(tray_click_events(4, true, false), &[0x400]);
+        assert_eq!(tray_click_events(4, true, false), &[WM_LBUTTONDOWN, WM_LBUTTONUP, 0x400]);
         assert_eq!(tray_click_events(4, true, true), &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]);
         assert_eq!(tray_click_events(0, false, false), &[WM_RBUTTONDOWN, WM_RBUTTONUP]);
-        assert_eq!(tray_click_events(4, false, false), &[WM_CONTEXTMENU]);
+        assert_eq!(tray_click_events(4, false, false), &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU]);
     }
 }

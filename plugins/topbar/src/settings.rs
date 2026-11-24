@@ -143,12 +143,14 @@ unsafe fn apply_frame(hw: HWND) {
 pub(crate) fn style_name(s: i18n::style::Style) -> &'static str {
     use i18n::style::Style::*;
     match s {
-        Normal => t!("Обычный", "Normal", ja: "通常", pt: "Normal"),
-        Terminal => t!("Терминал", "Terminal", ja: "ターミナル", pt: "Terminal"),
-        Dock => t!("Плавающий док", "Floating dock", ja: "フローティング ドック", pt: "Dock flutuante"),
-        Tiling => t!("Тайлинг", "Tiling", ja: "タイル表示", pt: "Lado a lado"),
-        Road => t!("Белая дорога", "White road", ja: "白い道", pt: "Estrada branca"),
-        Ruby => t!("Рубин", "Ruby", ja: "ルビー", pt: "Rubi"),
+        Normal => t!("Обычный", "Normal", ja: "通常", pt: "Normal", zh: "正常"),
+        Terminal => t!("Терминал", "Terminal", ja: "ターミナル", pt: "Terminal", zh: "终端"),
+        Dock => t!("Плавающий док", "Floating dock", ja: "フローティング ドック", pt: "Dock flutuante", zh: "悬浮停靠"),
+        Tiling => t!("Тайлинг", "Tiling", ja: "タイル表示", pt: "Lado a lado", zh: "平铺"),
+        Road => t!("Белая дорога", "White road", ja: "白い道", pt: "Estrada branca", zh: "白色道路"),
+        Ruby => t!("Рубин", "Ruby", ja: "ルビー", pt: "Rubi", zh: "红宝石"),
+        Win98 => "Windows 98",
+        Win7 => "Windows 7",
     }
 }
 
@@ -692,13 +694,13 @@ unsafe fn paint_settings(hw: HWND) {
             y += sc(38);
             y = section(dc, y, t!("ЯЗЫК ВСЕХ ПРОГРАММ WINRUST", "THE LANGUAGE OF EVERY WINRUST PROGRAM", ja: "すべての WINRUST プログラムの言語", pt: "O IDIOMA DE TODOS OS PROGRAMAS WINRUST"));
             let bw = (pw - sc(8)) / 2;
-            for (k, l) in [En, Ru, Ja, Pt].into_iter().enumerate() {
+            for (k, l) in [En, Ru, Ja, Pt, Zh].into_iter().enumerate() {
                 let (col, row) = (k as i32 % 2, k as i32 / 2);
                 let r = RECT { left: cx + col * (bw + sc(8)), top: y + row * sc(48), right: cx + col * (bw + sc(8)) + bw, bottom: y + row * sc(48) + sc(40) };
                 draw_pill(dc, r, l.name(), l == i18n::lang(), hot == Some(Hit::Lang(k as u8)), f_semi, None, false);
                 hits.push((r, Hit::Lang(k as u8)));
             }
-            y += sc(104);
+            y += sc(152); // three rows of pills
             SelectObject(dc, f_small);
             text(dc, t!("Панель и это окно переключаются сразу, остальные программы — при следующем запуске.", "The bar and this window switch at once, the other programs when they next start.", ja: "バーとこのウィンドウはすぐに、他のプログラムは次回起動時に切り替わります。", pt: "A barra e esta janela mudam na hora; os outros programas, ao abrir de novo."), RECT { left: cx, top: y, right: cx + pw, bottom: y + sc(20) }, pal().dim, DT_LEFT);
         }
@@ -762,7 +764,7 @@ unsafe fn on_click(hw: HWND, hit: Hit) {
         }
         Hit::Lang(k) => {
             use i18n::Lang::*;
-            i18n::set_lang([En, Ru, Ja, Pt][k as usize % 4]);
+            i18n::set_lang([En, Ru, Ja, Pt, Zh][k as usize % 5]);
             SetWindowTextW(hw, wide(settings_title()).as_ptr());
             relook(false);
         }
